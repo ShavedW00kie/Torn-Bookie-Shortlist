@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn_Bookie_Shortlist
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.0.4
-// @description  Inline Bookie stake and net-profit plans, 24-hour analysis, adjustable splits and optional external odds.
+// @version      1.0.5
+// @description  Inline Bookie stake and net-profit plans, optional draw coverage, 24-hour analysis and external odds.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
 // @match        https://www.torn.com/page.php*
@@ -24,18 +24,19 @@
 (function (nativeInfo) {
 'use strict';
 if (location.hostname !== 'www.torn.com' || location.pathname !== '/page.php' || new URLSearchParams(location.search).get('sid') !== 'bookie') return;
-const VERSION = '1.0.4';
+const VERSION = '1.0.5';
 const GM_info = {...(nativeInfo || {}), script: {...(nativeInfo?.script || {}), name: 'Torn_Bookie_Shortlist', version: VERSION}};
 const MyDebug = initializeModularDebugger(GM_info.script.name);
 /*
 Install: replace the previous script in Tampermonkey or TornPDA, save, and reload
 https://www.torn.com/page.php?sid=bookie. Drag the header or collapsed ticket.
 
-v1.0.4: fixes capture on nested TornPDA match cards and generated heading classes.
-Reads the market label separately from its bold time/date, uses outcome names
-without requiring bold team tags, and parses visible TCT start times. Capture
-diagnostics report missing identity, time, rows or supported market labels.
-Inline stakes, split modes, analysis, key testing and all settings remain.
+v1.0.5: optional draw coverage shares the same budget across all three outcomes.
+Balanced mode maximizes the smallest covered payout using whole-dollar stakes.
+Custom mode keeps the favorite percentage and balances the remaining budget
+between the opponent and draw. Every payout and net result is recalculated.
+Draw coverage defaults off. Two-way markets keep their two-outcome allocation.
+TornPDA capture fixes, analysis, key testing and existing settings remain.
 Donation UI v1.4 and debugger v1.0.4 are embedded below with their licenses.
 
 Coverage remains PARTIAL. This script passively reads loaded Bookie markets.
@@ -50,9 +51,10 @@ This is an implied estimate, not a measured win rate. Draw cannot satisfy the
 opponent threshold. Favorite/underdog filters use Torn's decimal multipliers.
 
 Inline plans are NEW wagers, not changes to existing bets. Net = winning payout
-minus BOTH stakes. A three-way draw loses the entire plan. An uncovered draw is
-not risk-free arbitrage. Balanced mode maximizes the smaller team-win result for
-the selected total budget using integer stakes. Payout estimates are rounded
+minus ALL stakes in the plan. An uncovered draw loses the entire plan; this is
+not risk-free arbitrage. With Include draw enabled, all three outcomes have
+stakes. Covering every outcome may lock in a loss, shown in red. Balanced mode
+maximizes the smallest covered result for the total budget. Payout estimates are rounded
 down to whole dollars using exact decimal arithmetic; actual settlement follows
 Torn's rules and the odds accepted when each wager is placed. Displayed amounts
 are compact; open Plan details for exact stakes. Nothing fills or submits bets.
@@ -76,7 +78,7 @@ const PREFIX = 'tw-shortlist-v1:', TTL = 5 * 60000, DAY = 86400000;
 const HEADING_SELECTOR='.matchName .name p, [class*="matchName___"] .name p, ul.pop-game > li.team .name p';
 const CARD_SELECTOR='li.c-pointer, ul.pop-list > li';
 const MARKET_NAMES=['2-Way Full event','3-Way Ordinary time'];
-const defaults = {min:1.3,max:2.5,dog:4,sex:'both',region:'all',country:'',sports:[],events:[],collapsed:true,x:12,y:90,providerRegion:'eu',inline:true,inlineScope:'all',budget:500000000,splitMode:'balanced',favoriteShare:80};
+const defaults = {min:1.3,max:2.5,dog:4,sex:'both',region:'all',country:'',sports:[],events:[],collapsed:true,x:12,y:90,providerRegion:'eu',inline:true,inlineScope:'all',budget:500000000,splitMode:'balanced',favoriteShare:80,includeDraw:false};
 let cfg = {...defaults}, key = '', root, uiStyle, body, home, settings, resultBox, statusBox, coverageBox, coverageDetails;
 let keyStatusBox, providerBox, providerSettingsBox, sportBox, eventBox, filterStatusBox, externalSettings, rememberBox;
 let externalButton, stopButton, testButton, gearButton, support;
@@ -137,10 +139,44 @@ function decimalRatio(value){
  const s=String(value);if(!/^\d+(?:\.\d+)?$/.test(s))return null;
  const [whole,part='']=s.split('.');return {n:BigInt(whole+part),d:10n**BigInt(part.length)};
 }
-function stakePlan(q,budget=cfg.budget,mode=cfg.splitMode,share=cfg.favoriteShare){
+function balancedStakes(total,ratios){
+ const count=BigInt(ratios.length);if(total<count)return null;
+ const required=payout=>ratios.map(r=>{const stake=(payout*r.d+r.n-1n)/r.n;return stake>0n?stake:1n;});
+ // An attainable payout P requires ceil(P / odds) dollars on each outcome.
+ // Binary search gives the exact maximum minimum payout without float errors.
+ let low=0n,high=ratios.map(r=>(total-count+1n)*r.n/r.d).reduce((a,b)=>a<b?a:b);
+ while(low<high){const mid=(low+high+1n)/2n;if(required(mid).reduce((a,b)=>a+b,0n)<=total)low=mid;else high=mid-1n;}
+ const base=required(low),left=total-base.reduce((a,b)=>a+b,0n);let best=null;
+ // Odds are greater than 1, so fewer than count dollars remain. Assign them
+ // to keep the covered returns as close as whole-dollar wagers permit.
+ const distribute=(index,remaining,stakes)=>{
+  if(index===base.length-1){const amounts=[...stakes,base[index]+remaining],payouts=amounts.map((s,i)=>s*ratios[i].n/ratios[i].d);
+   const min=payouts.reduce((a,b)=>a<b?a:b),max=payouts.reduce((a,b)=>a>b?a:b);
+   if(!best||min>best.min||min===best.min&&max<best.max)best={stakes:amounts,payouts,min,max};return;
+  }
+  for(let add=0n;add<=remaining;add++)distribute(index+1,remaining-add,[...stakes,base[index]+add]);
+ };
+ distribute(0,left,[]);return best;
+}
+function stakePlan(q,budget=cfg.budget,mode=cfg.splitMode,share=cfg.favoriteShare,includeDraw=cfg.includeDraw){
  if(!q||!Number.isSafeInteger(budget)||budget<2||budget>1000000000||!['balanced','custom'].includes(mode))return null;
  const f=decimalRatio(q.favorite.odds),d=decimalRatio(q.underdog.odds),total=BigInt(budget);
  if(!f||!d||f.n<=f.d||d.n<=d.d)return null;
+ const draw=q.e.outcomes.find(o=>norm(o.name)==='draw'),drawCovered=includeDraw===true&&!!draw;
+ if(drawCovered){
+  const g=decimalRatio(draw.odds);if(!g||g.n<=g.d||budget<3)return null;
+  let stakes;
+  if(mode==='balanced')stakes=balancedStakes(total,[f,d,g])?.stakes;
+  else{
+   if(!Number.isFinite(share)||share<=50||share>=100)return null;
+   const favorite=(total*BigInt(Math.round(share*100))+5000n)/10000n;
+   const rest=balancedStakes(total-favorite,[d,g]);if(favorite<1n||!rest)return null;
+   stakes=[favorite,...rest.stakes];
+  }
+  if(!stakes)return null;
+  const payouts=stakes.map((s,i)=>s*[f,d,g][i].n/[f,d,g][i].d),nets=payouts.map(p=>p-total);
+  return {budget,mode,share,drawCovered,favoriteStake:Number(stakes[0]),underdogStake:Number(stakes[1]),drawStake:Number(stakes[2]),favoritePayout:Number(payouts[0]),underdogPayout:Number(payouts[1]),drawPayout:Number(payouts[2]),favoriteNet:Number(nets[0]),underdogNet:Number(nets[1]),drawNet:Number(nets[2]),minimumNet:Number(nets.reduce((a,b)=>a<b?a:b))};
+ }
  const evaluate=a=>{const b=total-a;if(a<1n||b<1n)return null;
   const fp=a*f.n/f.d,dp=b*d.n/d.d,fn=fp-total,dn=dp-total;
   return {a,b,fp,dp,fn,dn,min:fn<dn?fn:dn};};
@@ -153,7 +189,7 @@ function stakePlan(q,budget=cfg.budget,mode=cfg.splitMode,share=cfg.favoriteShar
   best=evaluate((total*BigInt(Math.round(share*100))+5000n)/10000n);
  }
  if(!best)return null;
- return {budget,mode,share,favoriteStake:Number(best.a),underdogStake:Number(best.b),favoritePayout:Number(best.fp),underdogPayout:Number(best.dp),favoriteNet:Number(best.fn),underdogNet:Number(best.dn),minimumNet:Number(best.min),drawNet:q.e.outcomes.some(o=>norm(o.name)==='draw')?-budget:null};
+ return {budget,mode,share,drawCovered:false,favoriteStake:Number(best.a),underdogStake:Number(best.b),favoritePayout:Number(best.fp),underdogPayout:Number(best.dp),favoriteNet:Number(best.fn),underdogNet:Number(best.dn),minimumNet:Number(best.min),drawStake:draw?0:null,drawPayout:draw?0:null,drawNet:draw?-budget:null};
 }
 function money(value,compact=false,signed=false){
  const n=Math.abs(value),sign=value<0?'−':signed&&value>0?'+':'';
@@ -163,6 +199,11 @@ function money(value,compact=false,signed=false){
  return (Number(valueText)*unit[0]!==n?'≈':'')+sign+'$'+valueText+unit[1];
 }
 function planCondition(p){
+ if(p.drawCovered){
+  if(p.minimumNet>0)return 'Positive estimated net for all three outcomes.';
+  if(p.minimumNet===0)return 'All three outcomes are covered; at least one only breaks even.';
+  return p.mode==='balanced'?'This total cannot break even across all three outcomes at these odds.':'This split loses money on at least one covered outcome.';
+ }
  if(p.minimumNet>0)return p.drawNet===null?'Positive net if either team wins.':'Positive net if either team wins; a draw loses both stakes.';
  if(p.minimumNet===0)return 'At least one team result only breaks even.';
  return p.mode==='balanced'?'These odds cannot produce profit on both team wins.':'This split loses money on at least one team win.';
@@ -185,14 +226,17 @@ function renderInline(now,ranked){
   if(prior?.signature===sig&&prior.nodes.every(n=>n.isConnected)&&prior.targets.every((n,i)=>n===rows[i].target&&n.classList.contains('twsl-inline-target'))&&prior.nodes[0].parentElement===header&&prior.nodes.slice(1).every((n,i)=>n.parentElement===rows[i].target))continue;
   const open=prior?.nodes[0].open||false;if(prior)dropInline(prior);
   const details=el('details',undefined,'twsl-inline-plan');details.dataset.twslOwned='';details.open=open;
-  const label=el('summary',`New plan ${money(plan.budget,true)} · ${plan.drawNet===null?'team split':'draw not covered'}`);details.append(label);
+  const label=el('summary',`New plan ${money(plan.budget,true)} · ${plan.drawCovered?'draw included':plan.drawNet===null?'team split':'draw not covered'}`);details.append(label);
   details.append(el('p',`New wagers only. Existing bets are not included. Total: ${money(plan.budget)}.`));
-  details.append(el('p',plan.mode==='balanced'?'Balanced team-win returns.':`Custom split: ${plan.share}% on the odds favorite.`));
-  for(const [name,stake,payout,net]of [[q.favorite.name,plan.favoriteStake,plan.favoritePayout,plan.favoriteNet],[q.underdog.name,plan.underdogStake,plan.underdogPayout,plan.underdogNet]]){
+  details.append(el('p',plan.mode==='balanced'?(plan.drawCovered?'Balanced returns across all three outcomes.':'Balanced team-win returns.'):`Custom split: ${plan.share}% on the odds favorite.${plan.drawCovered?' The rest balances the opponent and draw returns.':''}`));
+  const lines=[[q.favorite.name,plan.favoriteStake,plan.favoritePayout,plan.favoriteNet]];
+  if(plan.drawCovered)lines.push(['Draw',plan.drawStake,plan.drawPayout,plan.drawNet]);
+  lines.push([q.underdog.name,plan.underdogStake,plan.underdogPayout,plan.underdogNet]);
+  for(const [name,stake,payout,net]of lines){
    const line=el('p');line.append(el('strong',name+': '),el('span',`Bet ${money(stake)}`,'twsl-stake'),document.createTextNode(` · payout ${money(payout)} · `),el('span',`net ${money(net,false,true)}`,net>0?'twsl-profit':net<0?'twsl-loss':'twsl-even'));details.append(line);
   }
-  if(plan.drawNet!==null)details.append(el('p',`Draw: ${money(plan.drawNet)} net. No draw wager in this plan.`,'twsl-loss'));
-  details.append(el('p',planCondition(plan)),el('p','Net subtracts both wagers. Inline amounts are rounded for display; exact stakes are above. Estimates use the displayed decimal odds, with payouts rounded down to whole dollars.'));
+  if(plan.drawNet!==null&&!plan.drawCovered)details.append(el('p',`Draw: ${money(plan.drawNet)} net. No draw wager in this plan.`,'twsl-loss'));
+  details.append(el('p',planCondition(plan)),el('p','Net subtracts all wagers in this plan. Inline amounts are rounded for display; exact stakes are above. Estimates use the displayed decimal odds, with payouts rounded down to whole dollars.'));
   details.append(el('p',`${(q.p*100).toFixed(1)}% Torn implied favorite estimate, not a measured win rate. Observed ${new Date(e.at).toLocaleTimeString()}.`));
   if(match){for(const row of match.rows)details.append(el('p',`${row.book}: ${row.outcomes.map(o=>o.name+' x'+o.price.toFixed(2)).join(' / ')}`,'twsl-inline-external'));details.append(el('p','External league and settlement equivalence are unverified. These quotes do not change the stake split.'));}
   else details.append(el('p',unmatchedLabel(),'twsl-inline-external'));
@@ -200,9 +244,9 @@ function renderInline(now,ranked){
   const nodes=[details],targets=[];
   for(const row of rows){
    const wrap=el('span',undefined,'twsl-inline-values');wrap.dataset.twslOwned='';
-   const isDraw=norm(row.name)==='draw',isFavorite=norm(row.name)===norm(q.favorite.name),stake=isFavorite?plan.favoriteStake:plan.underdogStake,net=isDraw?plan.drawNet:isFavorite?plan.favoriteNet:plan.underdogNet;
-   if(!isDraw){const bet=el('span',`Bet ${money(stake,true)}`,'twsl-stake');bet.title=`New stake: ${money(stake)}. Open Plan for exact amounts.`;bet.setAttribute('aria-label',`${row.name}: new stake ${money(stake)}`);wrap.append(bet);}
-   const profit=el('span',`${isDraw?'Loss':'Net'} ${money(net,true,true)}`,net>0?'twsl-profit':net<0?'twsl-loss':'twsl-even');profit.title=`Estimated net ${money(net,false,true)} after both stakes`;profit.setAttribute('aria-label',`${row.name}: estimated net ${money(net,false,true)} after both stakes`);wrap.append(profit);
+   const isDraw=norm(row.name)==='draw',isFavorite=norm(row.name)===norm(q.favorite.name),stake=isDraw?plan.drawStake:isFavorite?plan.favoriteStake:plan.underdogStake,net=isDraw?plan.drawNet:isFavorite?plan.favoriteNet:plan.underdogNet;
+   if(!isDraw||plan.drawCovered){const bet=el('span',`Bet ${money(stake,true)}`,'twsl-stake');bet.title=`New stake: ${money(stake)}. Open Plan for exact amounts.`;bet.setAttribute('aria-label',`${row.name}: new stake ${money(stake)}`);wrap.append(bet);}
+   const profit=el('span',`${isDraw&&!plan.drawCovered?'Loss':'Net'} ${money(net,true,true)}`,net>0?'twsl-profit':net<0?'twsl-loss':'twsl-even');profit.title=`Estimated net ${money(net,false,true)} after all stakes`;profit.setAttribute('aria-label',`${row.name}: estimated net ${money(net,false,true)} after all stakes`);wrap.append(profit);
    row.target.classList.add('twsl-inline-target');row.target.append(wrap);nodes.push(wrap);targets.push(row.target);
   }
   inlineViews.set(header,{signature:sig,nodes,targets});
@@ -460,13 +504,13 @@ function render(){
  text(providerBox,providerStatus);
  const count=catalog.filter(s=>s.active&&!s.has_outrights).length,quotaSummary=quotaText();
  text(providerSettingsBox,[providerStatus,quotaSummary&&!providerStatus.includes(quotaSummary)?quotaSummary:'',count?`A full scan can cost up to ${count} credits before cached responses. Key tests use no odds credits.`:'Key testing loads the sports catalog without using odds credits.'].filter(Boolean).join(' '));
- const sig=JSON.stringify([ranked,matched,unmatchedLabel(),cfg.budget,cfg.splitMode,cfg.favoriteShare]);
+ const sig=JSON.stringify([ranked,matched,unmatchedLabel(),cfg.budget,cfg.splitMode,cfg.favoriteShare,cfg.includeDraw]);
  if(sig!==lastRender){
   lastRender=sig;const opened=new Set([...resultBox.querySelectorAll('details[open]')].map(n=>n.dataset.event));resultBox.replaceChildren();
   for(const [i,q]of ranked.entries()){
    const card=el('article'),a=el('a',`${i+1}. ${q.e.name}`,'twsl-match');a.href='https://www.torn.com/page.php?sid=bookie#/'+encodeURIComponent(q.e.sport)+'/'+q.e.id;card.append(a);
    card.append(el('div',`${q.favorite.name} x${q.favorite.odds.toFixed(2)} · Opponent x${q.underdog.odds.toFixed(2)}`,'twsl-torn'));
-   const plan=stakePlan(q);if(plan)card.append(el('div',`New plan ${money(plan.budget,true)}: ${money(plan.favoriteStake,true)} / ${money(plan.underdogStake,true)}`),el('div',`Team-win net ${money(plan.favoriteNet,true,true)} / ${money(plan.underdogNet,true,true)}${plan.drawNet===null?'':'; draw '+money(plan.drawNet,true)}`,plan.minimumNet<0?'twsl-loss':'twsl-torn'));
+   const plan=stakePlan(q);if(plan)card.append(el('div',`New plan ${money(plan.budget,true)}: ${money(plan.favoriteStake,true)} favorite / ${money(plan.underdogStake,true)} opponent${plan.drawCovered?' / '+money(plan.drawStake,true)+' draw':''}`),el('div',`Team-win net ${money(plan.favoriteNet,true,true)} / ${money(plan.underdogNet,true,true)}${plan.drawNet===null?'':'; draw '+money(plan.drawNet,true,true)}`,plan.minimumNet<0?'twsl-loss':'twsl-torn'));
    card.append(el('div',`${(q.p*100).toFixed(1)}% Torn implied · ${new Date(q.e.start).toLocaleString(undefined,{weekday:'short',hour:'2-digit',minute:'2-digit'})}`,'twsl-torn'));
    const match=matched[i];card.append(el('div',match?`External: ${match.rows.length} matching bookmaker${match.rows.length===1?'':'s'}.`:unmatchedLabel(),'twsl-web'));
    const details=el('details');details.dataset.event=q.e.id;details.open=opened.has(q.e.id);details.append(el('summary','Details and quotes'));
@@ -512,9 +556,11 @@ async function savePlanSettings(){
  const raw=fields.budget.value.trim().replace(/^\$\s*/,''),m=raw.match(/^(\d+(?:,\d{3})*(?:\.\d+)?)\s*([kmb]?)$/i);
  const budget=m?Number(m[1].replace(/,/g,''))*({k:1e3,m:1e6,b:1e9}[m[2].toLowerCase()]||1):NaN,share=Math.round(Number(fields.favoriteShare.value)*100)/100;
  if(!Number.isSafeInteger(budget)||budget<2||budget>1000000000){text(planStatusBox,'Enter a total from $2 to $1b in whole dollars, for example 500m.');fields.budget.focus();return;}
+ if(fields.includeDraw.checked&&budget<3){text(planStatusBox,'Including the draw needs at least $3 total, with $1 or more on each outcome.');fields.budget.focus();return;}
  if(fields.splitMode.value==='custom'&&(!Number.isFinite(share)||share<=50||share>=100)){text(planStatusBox,'Favorite share must be greater than 50% and less than 100%.');fields.favoriteShare.focus();return;}
- cfg={...cfg,budget,inline:fields.inline.checked,inlineScope:fields.inlineScope.value,splitMode:fields.splitMode.value,favoriteShare:Number.isFinite(share)&&share>50&&share<100?Math.round(share*100)/100:cfg.favoriteShare};
- const saved=await savePrefs();text(planStatusBox,saved?'Inline plan settings saved.':'Plan settings applied for this session; saving failed.');log('Inline plan settings applied',{budget,mode:cfg.splitMode,inline:cfg.inline});render();
+ if(fields.includeDraw.checked&&fields.splitMode.value==='custom'&&BigInt(budget)-(BigInt(budget)*BigInt(Math.round(share*100))+5000n)/10000n<2n){text(planStatusBox,'Leave at least $2 for the opponent and draw. Increase the total or lower the favorite percentage.');fields.favoriteShare.focus();return;}
+ cfg={...cfg,budget,inline:fields.inline.checked,inlineScope:fields.inlineScope.value,splitMode:fields.splitMode.value,favoriteShare:Number.isFinite(share)&&share>50&&share<100?Math.round(share*100)/100:cfg.favoriteShare,includeDraw:fields.includeDraw.checked};
+ render();const saved=await savePrefs();text(planStatusBox,saved?'Inline plan settings saved.':'Plan settings applied for this session; saving failed.');log('Inline plan settings applied',{budget,mode:cfg.splitMode,inline:cfg.inline,includeDraw:cfg.includeDraw});
 }
 function mount(){
  if(root){if(!uiStyle.isConnected)document.documentElement.append(uiStyle);if(!root.isConnected)document.body.append(root);return;}
@@ -559,15 +605,16 @@ function mount(){
  actions.append(externalButton,recheck);coverageBox=el('div',undefined,'twsl-coverage');resultBox=el('div');providerBox=el('p',undefined,'twsl-web');providerBox.setAttribute('role','status');
  inlineStatusBox=el('p');inlineStatusBox.setAttribute('role','status');home.append(statusBox,inlineStatusBox,actions,coverageBox,providerBox);
  const rankedGroup=group(home,'Top five analysis');rankedGroup.id='twsl-ranked-summary';rankedGroup.append(resultBox);
- const about=group(home,'Coverage and method');coverageDetails=el('p');about.append(coverageDetails,el('p','Next 24 hours. Inline plans follow your filters; the top five summary ranks normalized Torn implied probability, including draw odds. This is an estimate, not a measured win rate.'),el('p','Blue = new stake. Green = positive net after both stakes. Red = loss. Open Plan beside a market for exact amounts and external quotes. No plan covers a three-way draw. Existing wagers are not included.'));
+ const about=group(home,'Coverage and method');coverageDetails=el('p');about.append(coverageDetails,el('p','Next 24 hours. Inline plans follow your filters; the top five summary ranks normalized Torn implied probability, including draw odds. This is an estimate, not a measured win rate.'),el('p','Blue = new stake. Green = positive net after all plan stakes. Red = loss. Open Plan beside a market for exact amounts and external quotes. Draw coverage is optional in settings; an uncovered draw loses the entire plan. Existing wagers are not included.'));
  settings.append(button('← Back to shortlist',()=>showSettings(false)),el('p','Version '+VERSION));
  const planSettings=group(settings,'Inline stakes and profit',true);
  const inlineField=field(planSettings,'inline','Show plans beside Bookie outcomes','checkbox','');inlineField.checked=cfg.inline;inlineField.parentElement.className='twsl-check';
  field(planSettings,'budget','Total stake per match (e.g. 500m)','text',String(cfg.budget)).inputMode='decimal';
- select(planSettings,'splitMode','Stake split',[['balanced','Balance the two team-win returns'],['custom','Custom favorite percentage']],cfg.splitMode).addEventListener('change',syncSplit);
+ const drawField=field(planSettings,'includeDraw','Include draw in three-way markets','checkbox','');drawField.checked=cfg.includeDraw;drawField.parentElement.className='twsl-check';
+ select(planSettings,'splitMode','Stake split',[['balanced','Balance returns across covered outcomes'],['custom','Custom favorite percentage']],cfg.splitMode).addEventListener('change',syncSplit);
  const shareField=field(planSettings,'favoriteShare','Favorite share (%)','number',cfg.favoriteShare);shareField.min='50.01';shareField.max='99.99';shareField.step='0.01';syncSplit();
  select(planSettings,'inlineScope','Annotate',[['all','All loaded matches meeting the filters'],['top5','Only the top five ranked matches']],cfg.inlineScope);
- planSettings.append(el('p','This budget is shared between both teams. Balanced mode gives the lower-odds team the larger stake. For $400m / $100m, use 500m total and 80% favorite.'),el('p','New wagers only; existing bets are not included. A three-way draw loses both stakes. Torn limits the combined bets on an event to $1b, including any already placed.'));
+ planSettings.append(el('p','The total stays the same. Balanced mode shares it between both teams, plus the draw when selected. Custom mode puts your chosen percentage on the favorite and balances the rest between the opponent and draw if included.'),el('p','Without draw coverage, 500m total and 80% favorite gives $400m / $100m. Including the draw can produce a loss on every outcome; losses appear in red. Two-way markets keep two stakes.'),el('p','New wagers only; existing bets are not included. An uncovered draw loses the entire plan. Torn limits the combined bets on an event to $1b, including any already placed.'));
  planStatusBox=el('p');planStatusBox.setAttribute('role','status');const savePlanButton=button('Save inline settings',()=>void savePlanSettings());savePlanButton.id='twsl-save-plan';planSettings.append(savePlanButton,planStatusBox);
  externalSettings=group(settings,'External odds',true);
  const keyField=field(externalSettings,'key','The Odds API key (optional)','password',key);keyField.spellcheck=false;keyField.setAttribute('autocapitalize','none');
@@ -615,7 +662,7 @@ async function boot(){
  if(!['eu','us','uk','au'].includes(cfg.providerRegion))cfg.providerRegion='eu';cfg.country=String(cfg.country||'').toUpperCase();
  if(!Number.isSafeInteger(cfg.budget)||cfg.budget<2||cfg.budget>1000000000)cfg.budget=defaults.budget;
  if(!['balanced','custom'].includes(cfg.splitMode))cfg.splitMode='balanced';if(!['all','top5'].includes(cfg.inlineScope))cfg.inlineScope='all';
- if(!Number.isFinite(cfg.favoriteShare)||cfg.favoriteShare<=50||cfg.favoriteShare>=100)cfg.favoriteShare=80;cfg.inline=cfg.inline!==false;
+ if(!Number.isFinite(cfg.favoriteShare)||cfg.favoriteShare<=50||cfg.favoriteShare>=100)cfg.favoriteShare=80;cfg.inline=cfg.inline!==false;cfg.includeDraw=cfg.includeDraw===true;
  key=await get('key','',true);if(typeof key!=='string')key='';key=key.trim();keyStatus=key?'Saved key loaded; tap Save & test key to verify it.':'No key saved.';
  mount();scanDOM();render();
  const observer=new MutationObserver(ms=>{if(!root.isConnected||!uiStyle.isConnected||ms.some(relevantMutation))schedule();});
