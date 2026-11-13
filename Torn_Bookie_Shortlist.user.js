@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn_Bookie_Shortlist
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.0.3
+// @version      1.0.4
 // @description  Inline Bookie stake and net-profit plans, 24-hour analysis, adjustable splits and optional external odds.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -24,16 +24,18 @@
 (function (nativeInfo) {
 'use strict';
 if (location.hostname !== 'www.torn.com' || location.pathname !== '/page.php' || new URLSearchParams(location.search).get('sid') !== 'bookie') return;
-const VERSION = '1.0.3';
+const VERSION = '1.0.4';
 const GM_info = {...(nativeInfo || {}), script: {...(nativeInfo?.script || {}), name: 'Torn_Bookie_Shortlist', version: VERSION}};
 const MyDebug = initializeModularDebugger(GM_info.script.name);
 /*
 Install: replace the previous script in Tampermonkey or TornPDA, save, and reload
 https://www.torn.com/page.php?sid=bookie. Drag the header or collapsed ticket.
 
-v1.0.3: inline blue stakes and green net profits, red losses, adjustable total
-budget and balanced/custom favorite splits. Exact stakes live in Plan details.
-Existing analysis, key testing, filters, capture logging and settings remain.
+v1.0.4: fixes capture on nested TornPDA match cards and generated heading classes.
+Reads the market label separately from its bold time/date, uses outcome names
+without requiring bold team tags, and parses visible TCT start times. Capture
+diagnostics report missing identity, time, rows or supported market labels.
+Inline stakes, split modes, analysis, key testing and all settings remain.
 Donation UI v1.4 and debugger v1.0.4 are embedded below with their licenses.
 
 Coverage remains PARTIAL. This script passively reads loaded Bookie markets.
@@ -71,6 +73,9 @@ localStorage or logs. Preferences can use localStorage. No bets are placed.
 No private betting history is collected or sent. Live TornPDA testing is needed.
 */
 const PREFIX = 'tw-shortlist-v1:', TTL = 5 * 60000, DAY = 86400000;
+const HEADING_SELECTOR='.matchName .name p, [class*="matchName___"] .name p, ul.pop-game > li.team .name p';
+const CARD_SELECTOR='li.c-pointer, ul.pop-list > li';
+const MARKET_NAMES=['2-Way Full event','3-Way Ordinary time'];
 const defaults = {min:1.3,max:2.5,dog:4,sex:'both',region:'all',country:'',sports:[],events:[],collapsed:true,x:12,y:90,providerRegion:'eu',inline:true,inlineScope:'all',budget:500000000,splitMode:'balanced',favoriteShare:80};
 let cfg = {...defaults}, key = '', root, uiStyle, body, home, settings, resultBox, statusBox, coverageBox, coverageDetails;
 let keyStatusBox, providerBox, providerSettingsBox, sportBox, eventBox, filterStatusBox, externalSettings, rememberBox;
@@ -80,7 +85,7 @@ const inlineViews=new Map();
 let busy=false, stopped=false, frame=0, catalog=[], quota={}, providerStatus='External: not checked.', keyStatus='No key saved.', lastRender='';
 let externalLoaded=false, scanComplete=false, prefsWrite=Promise.resolve(), lastCaptureSummary='', lastExternalRequestAt=0;
 const fields={}, events=new Map(), external=new Map(), metadata=new Map(), cache=new Map(), cardSignatures=new WeakMap(), seenIDs=new Set();
-let visibleCards=0, expandedCards=0;
+let visibleCards=0, expandedCards=0, captureDiagnostics={};
 const norm=s=>String(s??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
 const txt=n=>(n?.textContent||'').replace(/\s+/g,' ').trim();
 const stamp=v=>{const n=Number(v);return Number.isFinite(n)&&n>1e9?(n<1e11?n*1000:n):typeof v==='string'&&/(Z|[+-]\d\d:\d\d)$/.test(v)?Date.parse(v):NaN;};
@@ -105,7 +110,7 @@ function note(s){if(statusBox){text(statusBox,s);statusBox.hidden=!s;}}
 function route(hash){const m=String(hash).match(/^#\/([a-z0-9-]+)\/(\d+)\/?$/i);return m?{sport:m[1],id:m[2]}:null;}
 function validMarket(e){
  if(!e||!/^\d+$/.test(e.id)||!e.sport||!Number.isFinite(e.start)||!Array.isArray(e.participants)||e.participants.length!==2||!Array.isArray(e.outcomes))return false;
- if(!['2-Way Full event','3-Way Ordinary time'].includes(e.market))return false;
+ if(!MARKET_NAMES.includes(e.market))return false;
  const names=e.outcomes.map(o=>norm(o.name));
  if(names.length!==(e.market.startsWith('3')?3:2)||new Set(names).size!==names.length)return false;
  if(e.participants.some(p=>!norm(p)||!names.includes(norm(p)))||new Set(e.participants.map(norm)).size!==2)return false;
@@ -203,7 +208,13 @@ function renderInline(now,ranked){
   inlineViews.set(header,{signature:sig,nodes,targets});
  }
  for(const [header,view]of inlineViews)if(!keep.has(header)){dropInline(view);inlineViews.delete(header);}
- text(inlineStatusBox,cfg.inline?`${shown} expanded market${shown===1?'':'s'} annotated · ${money(cfg.budget,true)} new total per match`:'Inline plans are off.');
+ let summary=cfg.inline?`${shown} expanded market${shown===1?'':'s'} annotated · ${money(cfg.budget,true)} new total per match`:'Inline plans are off.';
+ if(cfg.inline&&!shown&&captureDiagnostics.marketHeaders){
+  if(captureDiagnostics.missingIdentity||captureDiagnostics.missingStart||captureDiagnostics.incompleteMarkets||captureDiagnostics.ambiguousMarkets)summary+=' Capture needs review; copy logs in Diagnostics.';
+  else if(!expandedCards)summary+=' Open a 2-Way Full event or 3-Way Ordinary time market.';
+  else summary+=' No fresh expanded markets meet the saved filters.';
+ }
+ text(inlineStatusBox,summary);
 }
 function marketSignature(e){return JSON.stringify([e.id,e.sport,e.start,e.country,e.competition,e.participants,e.market,e.outcomes]);}
 function remember(e){
@@ -212,45 +223,86 @@ function remember(e){
  events.set(k,e);seenIDs.add(e.id);
  if(!previous||marketSignature(previous)!==marketSignature(e))log(previous?'Market updated':'Market captured',{id:e.id,sport:e.sport,outcomes:e.outcomes.length});
 }
+function parseTCT(value){
+ const m=String(value||'').replace(/\s+/g,' ').trim().match(/^(?:Due to start at|Starts at)\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:-|on)\s*(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s*(?:TCT|UTC|GMT))?$/i);
+ if(!m)return NaN;const t=Date.UTC(+m[6],+m[5]-1,+m[4],+m[1],+m[2],+(m[3]||0)),d=new Date(t);
+ return d.getUTCFullYear()===+m[6]&&d.getUTCMonth()===+m[5]-1&&d.getUTCDate()===+m[4]&&d.getUTCHours()===+m[1]&&d.getUTCMinutes()===+m[2]&&d.getUTCSeconds()===+(m[3]||0)?t:NaN;
+}
 function dateFromDOM(card){
  for(const n of [card,...card.querySelectorAll('[data-start-timestamp],[data-start-time],[data-start],time[datetime],[title]')]){
+  if(n.closest('[data-twsl-owned]'))continue;
   for(const a of ['data-start-timestamp','data-start-time','data-start','datetime','title']){const s=n.getAttribute(a);if(!s)continue;const t=stamp(s);if(Number.isFinite(t))return t;
-   const m=s.match(/^(?:Due to start at|Starts at)\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:-|on)\s*(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s*(?:TCT|UTC|GMT))?$/i);
-   if(m){const t=Date.UTC(+m[6],+m[5]-1,+m[4],+m[1],+m[2],+(m[3]||0)),d=new Date(t);if(d.getUTCMonth()===+m[5]-1&&d.getUTCDate()===+m[4]&&d.getUTCHours()===+m[1]&&d.getUTCMinutes()===+m[2])return t;}
+   const displayed=parseTCT(s);if(Number.isFinite(displayed))return displayed;
   }
+ }
+ // The current Bookie renders its TCT date in a paragraph, not an attribute.
+ for(const n of card.querySelectorAll('.market-name-cell p,[class*="marketTime___"]')){
+  if(n.closest('[data-twsl-owned]'))continue;const t=parseTCT(clean(n));if(Number.isFinite(t))return t;
  }return NaN;
 }
 function clean(n){if(!n)return '';const c=n.cloneNode(true);c.querySelectorAll('.label,.tbma-inline,[data-twsl-owned]').forEach(x=>x.remove());return txt(c);}
+function marketLabel(header){
+ // Bold spans can be the start time and date. Require an explicit winner label.
+ const nodes=[header,...header.childNodes,...header.querySelectorAll('p,span,strong,b')];
+ const candidates=nodes.filter(n=>n.nodeType===3||!n.closest('[data-twsl-owned]')).map(n=>n.nodeType===3?txt(n):clean(n));
+ const found=MARKET_NAMES.filter(label=>candidates.some(s=>{
+  if(norm(s)===norm(label))return true;
+  const head=s.match(/^(2-Way Full event|3-Way Ordinary time)(?=\s*(?:Due to start at|Starts at|$))/i);
+  return !!head&&norm(head[1])===norm(label);
+ }));return found.length===1?found[0]:'';
+}
+function cardRoute(card,heading){
+ const link=heading.closest('a[href]'),links=link&&card.contains(link)?[link]:[...card.querySelectorAll('a[href]')].filter(a=>!a.closest('[data-twsl-owned]'));
+ const found=new Map();for(const a of links){try{const u=new URL(a.href,location.href),r=u.origin===location.origin&&u.pathname==='/page.php'?route(u.hash):null;if(r)found.set(r.sport+'|'+r.id,r);}catch(_){}}
+ if(found.size===1)return [...found.values()][0];if(found.size>1)return null;
+ // A page hash is usable only when it identifies the sole active match card.
+ const active=[...document.querySelectorAll('li.c-pointer.active')];
+ return card.classList.contains('active')&&active.length===1&&active[0]===card?route(location.hash):null;
+}
 function scanDOM(){
- const cards=[...new Set([...document.querySelectorAll('.matchName .name p')].map(p=>p.closest('li')).filter(Boolean))];
- visibleCards=cards.length;expandedCards=0;domMarkets=[];
- for(const card of cards){
-  const r=(card.classList.contains('active')?route(location.hash):null)||[...card.querySelectorAll('a[href]')].map(a=>{try{return route(new URL(a.href,location.href).hash);}catch(_){return null;}}).find(Boolean);
-  if(!r)continue;seenIDs.add(r.id);
-  const p=card.querySelector('.matchName .name p'),participants=[...p.querySelectorAll('b')].map(txt),meta=metadata.get(r.id)||{},start=dateFromDOM(card);
-  const e={...r,name:participants.join(' v '),participants,competition:txt(p).replace(/^.*?\s-\s/,''),start:Number.isFinite(start)?start:meta.start,country:meta.country||'',at:Date.now()};
-  if(participants.length!==2)continue;
+ const headings=[...document.querySelectorAll(HEADING_SELECTOR)].filter(p=>!p.closest('[data-twsl-owned],#tw-shortlist'));
+ const cards=new Map();for(const p of headings){const card=p.closest(CARD_SELECTOR)||p.closest('li');if(card&&!cards.has(card))cards.set(card,p);}
+ visibleCards=cards.size;expandedCards=0;domMarkets=[];
+ const diagnostic={headingNodes:headings.length,marketHeaders:0,unsupportedHeaders:0,missingIdentity:0,missingStart:0,incompleteMarkets:0,ambiguousMarkets:0};
+ for(const [card,p] of cards){
   const markets=[];
   for(const ul of card.querySelectorAll('ul.bets-wrap')){
+   if(ul.closest(CARD_SELECTOR)!==card&&card.matches(CARD_SELECTOR))continue;
    let m=null;
    for(const li of ul.children){if(!li.classList.contains('bets'))continue;const h=li.querySelector('.market-name-cell');
-    if(h){m={market:txt(h.querySelector('.bold')),outcomes:[],header:h,rows:[]};markets.push(m);continue;}
+    if(h){diagnostic.marketHeaders++;const label=marketLabel(h);if(!label)diagnostic.unsupportedHeaders++;m={market:label,outcomes:[],header:h,rows:[],rowCount:0};markets.push(m);continue;}
     if(!m)continue;const c=li.querySelector('.cells-wrap'),dest=c?.querySelector('.result'),o=c?.querySelector('.odds.decimal'),input=c?.querySelector('input.amount');
+    m.rowCount++;
     if(!dest||!o)continue;const name=clean(dest);m.outcomes.push({name,odds:Number(clean(o).replace(/^x\s*/i,'')),suspended:!!input?.disabled||/suspended/i.test(input?.value||'')});m.rows.push({name,target:dest});
    }
   }
-  const supported=markets.filter(m=>['2-Way Full event','3-Way Ordinary time'].includes(m.market));
+  const supported=markets.filter(m=>MARKET_NAMES.includes(m.market));
   if(supported.length)expandedCards++;
+  const r=cardRoute(card,p);if(!r){diagnostic.missingIdentity++;continue;}seenIDs.add(r.id);
+  const meta=metadata.get(r.id)||{},start=dateFromDOM(card),headingText=clean(p),dash=headingText.indexOf(' - ');
+  const base={...r,competition:dash<0?'':headingText.slice(dash+3),start:Number.isFinite(start)?start:meta.start,country:meta.country||'',at:Date.now()};
+  const data=[],ambiguous=new Set(supported.filter(m=>supported.filter(other=>other.market===m.market).length>1).map(m=>m.market));
+  for(const m of supported){
+   if(ambiguous.has(m.market)){diagnostic.ambiguousMarkets++;continue;}
+   // Exhaustive supported winner markets supply their own participant labels.
+   const participants=m.outcomes.filter(o=>norm(o.name)!=='draw').map(o=>o.name);
+   const e={...base,name:participants.join(' v '),participants,market:m.market,outcomes:m.outcomes};
+   if(!Number.isFinite(e.start))diagnostic.missingStart++;
+   if(m.rowCount!==(m.market.startsWith('3')?3:2)||!validMarket({...e,start:Number.isFinite(e.start)?e.start:0}))diagnostic.incompleteMarkets++;
+   // Missing rows must never become a complete market by silently skipping them.
+   if(m.rowCount!==m.outcomes.length)e.outcomes=[];
+   data.push(e);domMarkets.push({e,header:m.header,rows:m.rows,card});
+  }
   const disabled=card.classList.contains('disabled')||card.getAttribute('aria-disabled')==='true';
   // Clock text and unrelated widgets must never renew a price's timestamp.
-  const data=supported.map(({market,outcomes})=>({market,outcomes}));
-  for(const m of supported)domMarkets.push({e:{...e,market:m.market,outcomes:m.outcomes},header:m.header,rows:m.rows,card});
-  const signature=JSON.stringify([r.id,r.sport,e.start,e.country,e.competition,participants,disabled,data]);
+  const signature=JSON.stringify([r.id,r.sport,base.start,base.country,base.competition,disabled,[...ambiguous],data.map(m=>[m.market,m.participants,m.outcomes])]);
   if(cardSignatures.get(card)===signature)continue;cardSignatures.set(card,signature);
   if(disabled){for(const [k,v]of events)if(v.id===r.id&&events.delete(k))log('Market disabled',{id:r.id},'WARN');continue;}
-  for(const m of data)remember({...e,...m});
+  for(const name of ambiguous)events.delete(r.id+'|'+name);
+  for(const e of data)remember(e);
  }
- const summary={visibleCards,expandedCards,capturedMarkets:events.size,seenEvents:new Set([...seenIDs,...metadata.keys()]).size};
+ captureDiagnostics=diagnostic;
+ const summary={visibleCards,expandedCards,capturedMarkets:events.size,seenEvents:new Set([...seenIDs,...metadata.keys()]).size,...diagnostic};
  const sig=JSON.stringify(summary);if(sig!==lastCaptureSummary){lastCaptureSummary=sig;log('Capture summary',summary);}
 }
 function updateMetadata(m){
@@ -406,8 +458,8 @@ function render(){
  text(coverageDetails,`${events.size} complete markets captured this session; ${visibleCards} cards currently loaded, ${expandedCards} with winner markets expanded. Open sports and expand matches to collect more. Capture is partial, never all Torn events. Prices expire after 5 minutes. Reopen a market to observe it again.`);
  text(keyStatusBox,keyStatus);
  text(providerBox,providerStatus);
- const count=catalog.filter(s=>s.active&&!s.has_outrights).length;
- text(providerSettingsBox,[providerStatus,quotaText(),count?`A full scan can cost up to ${count} credits before cached responses. Key tests use no odds credits.`:'Key testing loads the sports catalog without using odds credits.'].filter(Boolean).join(' '));
+ const count=catalog.filter(s=>s.active&&!s.has_outrights).length,quotaSummary=quotaText();
+ text(providerSettingsBox,[providerStatus,quotaSummary&&!providerStatus.includes(quotaSummary)?quotaSummary:'',count?`A full scan can cost up to ${count} credits before cached responses. Key tests use no odds credits.`:'Key testing loads the sports catalog without using odds credits.'].filter(Boolean).join(' '));
  const sig=JSON.stringify([ranked,matched,unmatchedLabel(),cfg.budget,cfg.splitMode,cfg.favoriteShare]);
  if(sig!==lastRender){
   lastRender=sig;const opened=new Set([...resultBox.querySelectorAll('details[open]')].map(n=>n.dataset.event));resultBox.replaceChildren();
@@ -550,8 +602,9 @@ function relevantMutation(m){
   const withoutOwn=s=>String(s||'').split(/\s+/).filter(x=>x&&x!=='twsl-inline-target').sort().join(' ');
   if(withoutOwn(m.oldValue)===withoutOwn(n.className))return !n.classList.contains('twsl-inline-target')&&[...inlineViews.values()].some(v=>v.targets.includes(n));
  }
- if(n?.closest('.matchName,ul.bets-wrap,li.c-pointer,li.disabled'))return true;
- return [...m.addedNodes,...m.removedNodes].some(x=>x.nodeType===1&&(x.matches('.matchName,ul.bets-wrap,li.c-pointer')||x.querySelector('.matchName,ul.bets-wrap')));
+ const relevant='.matchName,[class*="matchName___"],ul.pop-game,ul.bets-wrap,ul.pop-list,li.c-pointer,li.disabled';
+ if(n?.closest(relevant))return true;
+ return [...m.addedNodes,...m.removedNodes].some(x=>x.nodeType===1&&(x.matches(relevant)||x.querySelector(relevant)));
 }
 hook();
 async function boot(){
