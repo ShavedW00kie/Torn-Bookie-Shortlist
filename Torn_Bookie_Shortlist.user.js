@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn_Bookie_Shortlist
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.0.1
-// @description  Evidence-only 24-hour Bookie shortlist, coverage reporting and optional external odds.
+// @version      1.0.2
+// @description  Compact 24-hour Bookie shortlist, partial coverage and optional external odds with key testing.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
 // @match        https://www.torn.com/page.php*
@@ -24,279 +24,414 @@
 (function (nativeInfo) {
 'use strict';
 if (location.hostname !== 'www.torn.com' || location.pathname !== '/page.php' || new URLSearchParams(location.search).get('sid') !== 'bookie') return;
-const GM_info = nativeInfo || {script: {name: 'Torn_Bookie_Shortlist'}};
+const VERSION = '1.0.2';
+const GM_info = {...(nativeInfo || {}), script: {...(nativeInfo?.script || {}), name: 'Torn_Bookie_Shortlist', version: VERSION}};
 const MyDebug = initializeModularDebugger(GM_info.script.name);
 /*
-INSTALL: Tampermonkey > Create a new script > paste this whole file > Save.
-TornPDA: add this file as a custom userscript; document-start capture is preferred.
-Open https://www.torn.com/page.php?sid=bookie. Drag the header or collapsed ticket.
-Settings defaults: x1.30 through x2.50 favorite; opponent x4.00 or higher; 24 hours.
+Install: replace the previous script in Tampermonkey or TornPDA, save, and reload
+https://www.torn.com/page.php?sid=bookie. Drag the header or collapsed ticket.
 
-COVERAGE LIMITATION: This release DOES NOT scan every Torn event automatically.
-It observes loaded markets and never labels that subset as complete. Open sport
-categories and expand matches to populate it. Only exhaustive two-competitor
-2-Way Full event / 3-Way Ordinary time markets are supported. Race/outright
-fields and unknown market scopes are excluded. Unknown event country/gender
-remain unknown, and are excluded by specific filters. Country means event
-country metadata, not participant nationality. Unlabeled men's events can be
-excluded by the men's-only filter.
+v1.0.2: independent external key setup; fresh key test and quota feedback;
+conditional country validation; compact cards and grouped settings; preserved
+draft selections; state-change capture logs; no freshness extension from clocks.
+Donation UI v1.4 and debugger v1.0.4 are embedded below with their licenses.
 
-RANKING: p = (1/favorite_decimal) / sum(1/outcome_decimal), including the draw.
-This is an odds-derived estimate, not a true or empirically verified win rate.
-Top five are distinct events; fewer are shown when fewer qualify. Draw cannot
-satisfy the opponent threshold. All comparisons use Torn multipliers.
+Coverage remains PARTIAL. This script passively reads loaded Bookie markets.
+Open sports and expand matches to capture them. No automatic all-event feed is
+claimed. Only exhaustive two-participant 2-Way Full event / 3-Way Ordinary time
+markets are accepted. Races, outrights and unknown market scopes are excluded.
+Country means explicit event-country metadata, never participant nationality.
+Men/women-only filters exclude events whose category is not explicitly labeled.
 
-EXTERNAL: Save a The Odds API key, load external sports, then refresh external.
-One h2h market and one bookmaker region are requested per active competition.
-A broad scan can consume many quota credits. The sports catalog is cached for
-24h, odds for 5 minutes. Stop halts after the current request. Requests are
-manual and sequential; failures stop the scan and preserve a partial status.
-Only exact accent-normalized participants, start within 5 minutes, and matching
-outcome sets are displayed. Ambiguous fixtures and stale quotes are excluded.
-League and settlement compatibility are not proven, so external quotes do not
-alter ranking. No web-derived performance statistics are fabricated.
+Ranking uses (1/favorite odds) / sum(1/all outcome odds), including the draw.
+This is an implied estimate, not a measured win rate. Draw cannot satisfy the
+opponent threshold. Favorite/underdog filters use Torn's decimal multipliers.
 
-PRIVACY: No Torn API key is needed or requested. Optional external keys go only
-to The Odds API and are stored only with the remember checkbox in GM storage.
-No key is put in localStorage. Preferences use localStorage as a fallback.
-No bet placement, hidden-page crawling, or private betting-history export.
+External setup: Settings > External odds > Save & test key. The sports catalog
+test uses /v4/sports/ and no odds credits. Check external odds then scans active
+match competitions, one h2h market and one bookmaker region per request.
+Up to one credit per uncached competition; Stop ends after the current request.
+Requests are manual, sequential and cached: catalog 24 hours, odds 5 minutes.
+Names are accent-normalized; sport family, starts within 5 minutes and identical
+outcome sets are required. Ambiguous fixtures and stale quotes are excluded.
+League and settlement equivalence are unverified. External quotes do not change
+the ranking. No performance statistics or probabilities are invented.
 
-VALIDATION: Pure filtering and ranking checks plus a local DOM fixture are
-used during development; live Torn/TornPDA integration requires user testing.
+No Torn API key is needed. Optional external keys go only to The Odds API, and
+persist only in userscript storage if Remember is checked. They never enter
+localStorage or logs. Preferences can use localStorage. No bets are placed.
+No private betting history is collected or sent. Live TornPDA testing is needed.
 */
-const PREFIX = 'tw-shortlist-v1:';
-const TTL = 5 * 60000, DAY = 86400000;
-const defaults = {min:1.3,max:2.5,dog:4,sex:'both',region:'all',country:'US',sports:[],events:[],collapsed:false,x:12,y:90,providerRegion:'eu'};
-let cfg = {...defaults}, key = '', root, resultBox, statusBox, settings, sportBox, eventBox, support;
-let busy=false, stopped=false, frame=0, lastDOM='', providerStatus='External odds not loaded.', catalog=[];
-const events=new Map(), external=new Map(), metadata=new Map(), cache=new Map();
+const PREFIX = 'tw-shortlist-v1:', TTL = 5 * 60000, DAY = 86400000;
+const defaults = {min:1.3,max:2.5,dog:4,sex:'both',region:'all',country:'',sports:[],events:[],collapsed:false,x:12,y:90,providerRegion:'eu'};
+let cfg = {...defaults}, key = '', root, uiStyle, body, home, settings, resultBox, statusBox, coverageBox, coverageDetails;
+let keyStatusBox, providerBox, providerSettingsBox, sportBox, eventBox, filterStatusBox, externalSettings, rememberBox;
+let externalButton, stopButton, testButton, gearButton, support;
+let busy=false, stopped=false, frame=0, catalog=[], quota={}, providerStatus='External: not checked.', keyStatus='No key saved.', lastRender='';
+let externalLoaded=false, scanComplete=false, prefsWrite=Promise.resolve(), lastCaptureSummary='', lastExternalRequestAt=0;
+const fields={}, events=new Map(), external=new Map(), metadata=new Map(), cache=new Map(), cardSignatures=new WeakMap(), seenIDs=new Set();
+let visibleCards=0, expandedCards=0;
 const norm=s=>String(s??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
 const txt=n=>(n?.textContent||'').replace(/\s+/g,' ').trim();
 const stamp=v=>{const n=Number(v);return Number.isFinite(n)&&n>1e9?(n<1e11?n*1000:n):typeof v==='string'&&/(Z|[+-]\d\d:\d\d)$/.test(v)?Date.parse(v):NaN;};
 const log=(event,extra={},level='INFO')=>MyDebug.log({event,...extra},level);
-async function get(k,d,secret=false){try{if(typeof GM_getValue==='function')return await GM_getValue(PREFIX+k,d);if(typeof GM!=='undefined'&&GM.getValue)return await GM.getValue(PREFIX+k,d);if(!secret)return JSON.parse(localStorage.getItem(PREFIX+k)||'null')??d;}catch(_){log('Storage read failed',{item:k},'WARN');}return d;}
-async function put(k,v,secret=false){try{if(typeof GM_setValue==='function'){await GM_setValue(PREFIX+k,v);return true;}if(typeof GM!=='undefined'&&GM.setValue){await GM.setValue(PREFIX+k,v);return true;}if(!secret){localStorage.setItem(PREFIX+k,JSON.stringify(v));return true;}}catch(_){log('Storage write failed',{item:k},'WARN');}return false;}
+async function get(k,d,secret=false){
+ const readers=[];if(typeof GM_getValue==='function')readers.push(()=>GM_getValue(PREFIX+k,d));
+ if(typeof GM!=='undefined'&&typeof GM.getValue==='function')readers.push(()=>GM.getValue(PREFIX+k,d));
+ if(!secret)readers.push(()=>JSON.parse(localStorage.getItem(PREFIX+k)||'null')??d);
+ for(const read of readers)try{return (await read())??d;}catch(_){log('Storage read failed',{item:k},'WARN');}return d;
+}
+async function put(k,v,secret=false){
+ const writers=[];if(typeof GM_setValue==='function')writers.push(()=>GM_setValue(PREFIX+k,v));
+ if(typeof GM!=='undefined'&&typeof GM.setValue==='function')writers.push(()=>GM.setValue(PREFIX+k,v));
+ if(!secret)writers.push(()=>localStorage.setItem(PREFIX+k,JSON.stringify(v)));
+ for(const write of writers)try{await write();return true;}catch(_){log('Storage write failed',{item:k},'WARN');}return false;
+}
+function savePrefs(){const snapshot=JSON.parse(JSON.stringify(cfg));prefsWrite=prefsWrite.then(()=>put('settings',snapshot));return prefsWrite;}
 function el(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;}
 function button(label,fn){const b=el('button',label);b.type='button';b.addEventListener('click',fn);return b;}
-function note(s){if(statusBox)statusBox.textContent=s;}
+function text(n,s){if(n&&n.textContent!==s)n.textContent=s;}
+function note(s){if(statusBox){text(statusBox,s);statusBox.hidden=!s;}}
 function route(hash){const m=String(hash).match(/^#\/([a-z0-9-]+)\/(\d+)\/?$/i);return m?{sport:m[1],id:m[2]}:null;}
 function validMarket(e){
- if(!e||!/^\d+$/.test(e.id)||!e.sport||!Number.isFinite(e.start)||e.participants.length!==2)return false;
+ if(!e||!/^\d+$/.test(e.id)||!e.sport||!Number.isFinite(e.start)||!Array.isArray(e.participants)||e.participants.length!==2||!Array.isArray(e.outcomes))return false;
  if(!['2-Way Full event','3-Way Ordinary time'].includes(e.market))return false;
  const names=e.outcomes.map(o=>norm(o.name));
  if(names.length!==(e.market.startsWith('3')?3:2)||new Set(names).size!==names.length)return false;
- if(e.participants.some(p=>!names.includes(norm(p)))||new Set(e.participants.map(norm)).size!==2)return false;
+ if(e.participants.some(p=>!norm(p)||!names.includes(norm(p)))||new Set(e.participants.map(norm)).size!==2)return false;
  if(names.length===3&&!names.includes('draw'))return false;
  return e.outcomes.every(o=>o.name&&Number.isFinite(o.odds)&&o.odds>1&&o.odds<=1e6&&!o.suspended);
 }
 function gender(e){const s=norm(e.competition+' '+e.name);if(/\b(women|womens|female|ladies|wnba|wta)\b/.test(s))return 'women';if(/\b(men|mens|male|atp)\b/.test(s))return 'men';return 'unknown';}
 function qualifying(e,now=Date.now()){
- if(!validMarket(e)||e.start<=now||e.start>now+DAY||now-e.at>TTL||e.at>now+30000)return null;
+ if(!validMarket(e)||!Number.isFinite(e.at)||e.start<=now||e.start>now+DAY||now-e.at>TTL||e.at>now+30000)return null;
  if(cfg.sports.length&&!cfg.sports.includes(e.sport))return null;
  if(cfg.events.length&&!cfg.events.includes(e.id))return null;
  if(cfg.sex!=='both'&&gender(e)!==cfg.sex)return null;
  if(cfg.region!=='all'&&(!e.country||(cfg.region==='international'?e.country==='US':e.country!==(cfg.region==='us'?'US':cfg.country))))return null;
  const teams=e.outcomes.filter(o=>e.participants.some(p=>norm(p)===norm(o.name))).sort((a,b)=>a.odds-b.odds);
  if(teams.length!==2||teams[0].odds===teams[1].odds||teams[0].odds<cfg.min||teams[0].odds>cfg.max||teams[1].odds<cfg.dog)return null;
- // The candidate must also be the favorite against a possible draw.
  if(e.outcomes.some(o=>o.odds<teams[0].odds))return null;
- const total=e.outcomes.reduce((s,o)=>s+1/o.odds,0);
- return {e,favorite:teams[0],underdog:teams[1],p:(1/teams[0].odds)/total};
+ return {e,favorite:teams[0],underdog:teams[1],p:(1/teams[0].odds)/e.outcomes.reduce((s,o)=>s+1/o.odds,0)};
 }
 function rankings(now=Date.now()){
  const best=new Map();for(const e of events.values()){const q=qualifying(e,now);if(q&&(!best.has(e.id)||best.get(e.id).p<q.p))best.set(e.id,q);}
  return [...best.values()].sort((a,b)=>b.p-a.p||a.e.start-b.e.start||a.e.id.localeCompare(b.e.id)).slice(0,5);
 }
-function remember(e){const k=e.id+'|'+e.market;if(validMarket(e)){events.set(k,e);log('Market captured',{id:e.id,sport:e.sport,outcomes:e.outcomes.length});}else events.delete(k);}
+function marketSignature(e){return JSON.stringify([e.id,e.sport,e.start,e.country,e.competition,e.participants,e.market,e.outcomes]);}
+function remember(e){
+ const k=e.id+'|'+e.market,previous=events.get(k);
+ if(!validMarket(e)){if(events.delete(k))log('Market invalidated',{id:e.id,market:e.market},'WARN');return;}
+ events.set(k,e);seenIDs.add(e.id);
+ if(!previous||marketSignature(previous)!==marketSignature(e))log(previous?'Market updated':'Market captured',{id:e.id,sport:e.sport,outcomes:e.outcomes.length});
+}
 function dateFromDOM(card){
- for(const n of card.querySelectorAll('[data-start-timestamp],[data-start-time],[data-start],time[datetime],[title]')){
+ for(const n of [card,...card.querySelectorAll('[data-start-timestamp],[data-start-time],[data-start],time[datetime],[title]')]){
   for(const a of ['data-start-timestamp','data-start-time','data-start','datetime','title']){const s=n.getAttribute(a);if(!s)continue;const t=stamp(s);if(Number.isFinite(t))return t;
-   // Torn's countdown tooltip uses Torn City Time (UTC), not the browser timezone.
    const m=s.match(/^(?:Due to start at|Starts at)\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:-|on)\s*(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s*(?:TCT|UTC|GMT))?$/i);
-   if(m){const t=Date.UTC(+m[6],+m[5]-1,+m[4],+m[1],+m[2],+(m[3]||0));const d=new Date(t);if(d.getUTCMonth()===+m[5]-1&&d.getUTCDate()===+m[4]&&d.getUTCHours()===+m[1])return t;}
+   if(m){const t=Date.UTC(+m[6],+m[5]-1,+m[4],+m[1],+m[2],+(m[3]||0)),d=new Date(t);if(d.getUTCMonth()===+m[5]-1&&d.getUTCDate()===+m[4]&&d.getUTCHours()===+m[1]&&d.getUTCMinutes()===+m[2])return t;}
   }
  }return NaN;
 }
 function clean(n){if(!n)return '';const c=n.cloneNode(true);c.querySelectorAll('.label,.tbma-inline').forEach(x=>x.remove());return txt(c);}
 function scanDOM(){
- const cards=[...document.querySelectorAll('li.c-pointer')].filter(c=>c.querySelector('.matchName .name p'));
- const signature=location.hash+'|'+cards.map(c=>c.textContent+Array.from(c.querySelectorAll('[title]'),n=>n.title).join('|')).join('|');
- if(signature===lastDOM)return;lastDOM=signature;
+ const cards=[...new Set([...document.querySelectorAll('.matchName .name p')].map(p=>p.closest('li')).filter(Boolean))];
+ visibleCards=cards.length;expandedCards=0;
  for(const card of cards){
-  const r=(card.classList.contains('active')?route(location.hash):null)||[...card.querySelectorAll('a[href]')].map(a=>route(new URL(a.href,location.href).hash)).find(Boolean);
-  if(!r)continue;
-  const p=card.querySelector('.matchName .name p'),participants=[...p.querySelectorAll('b')].map(txt);
-  const meta=metadata.get(r.id)||{},start=dateFromDOM(card),competition=txt(p).replace(/^.*?\s-\s/,'');
-  const e={...r,name:participants.join(' v '),participants,competition,start:Number.isFinite(start)?start:meta.start,country:meta.country||'',at:Date.now()};
+  const r=(card.classList.contains('active')?route(location.hash):null)||[...card.querySelectorAll('a[href]')].map(a=>{try{return route(new URL(a.href,location.href).hash);}catch(_){return null;}}).find(Boolean);
+  if(!r)continue;seenIDs.add(r.id);
+  const p=card.querySelector('.matchName .name p'),participants=[...p.querySelectorAll('b')].map(txt),meta=metadata.get(r.id)||{},start=dateFromDOM(card);
+  const e={...r,name:participants.join(' v '),participants,competition:txt(p).replace(/^.*?\s-\s/,''),start:Number.isFinite(start)?start:meta.start,country:meta.country||'',at:Date.now()};
   if(participants.length!==2)continue;
-  let readAny=false;
+  const markets=[];
   for(const ul of card.querySelectorAll('ul.bets-wrap')){
-   let m=null;const markets=[];
+   let m=null;
    for(const li of ul.children){if(!li.classList.contains('bets'))continue;const h=li.querySelector('.market-name-cell');
     if(h){m={market:txt(h.querySelector('.bold')),outcomes:[]};markets.push(m);continue;}
     if(!m)continue;const c=li.querySelector('.cells-wrap'),dest=c?.querySelector('.result'),o=c?.querySelector('.odds.decimal'),input=c?.querySelector('input.amount');
     if(!dest||!o)continue;m.outcomes.push({name:txt(dest.querySelector('span'))||txt(dest),odds:Number(clean(o).replace(/^x\s*/i,'')),suspended:!!input?.disabled||/suspended/i.test(input?.value||'')});
    }
-   for(const m of markets){if(['2-Way Full event','3-Way Ordinary time'].includes(m.market)){remember({...e,...m});readAny=true;}}
   }
-  // A newly disabled card invalidates earlier captured prices.
-  if(card.classList.contains('disabled'))for(const [k,v]of events)if(v.id===r.id)events.delete(k);
-  if(!readAny)log('Match needs expanded winner market',{id:r.id},'DEBUG');
+  const supported=markets.filter(m=>['2-Way Full event','3-Way Ordinary time'].includes(m.market));
+  if(supported.length)expandedCards++;
+  const disabled=card.classList.contains('disabled')||card.getAttribute('aria-disabled')==='true';
+  // Clock text and unrelated widgets must never renew a price's timestamp.
+  const signature=JSON.stringify([r.id,r.sport,e.start,e.country,e.competition,participants,disabled,supported]);
+  if(cardSignatures.get(card)===signature)continue;cardSignatures.set(card,signature);
+  if(disabled){for(const [k,v]of events)if(v.id===r.id&&events.delete(k))log('Market disabled',{id:r.id},'WARN');continue;}
+  for(const m of supported)remember({...e,...m});
  }
+ const summary={visibleCards,expandedCards,capturedMarkets:events.size,seenEvents:new Set([...seenIDs,...metadata.keys()]).size};
+ const sig=JSON.stringify(summary);if(sig!==lastCaptureSummary){lastCaptureSummary=sig;log('Capture summary',summary);}
+}
+function updateMetadata(m){
+ if(!m?.ID)return;const id=String(m.ID),previous=metadata.get(id)||{},start=stamp(m.startTimestamp);
+ metadata.set(id,{start:Number.isFinite(start)?start:previous.start,country:/^[A-Za-z]{2}$/.test(m.countryCode||'')?m.countryCode.toUpperCase():previous.country||''});
 }
 function consume(data){
  if(!data||typeof data!=='object')return;
  const payload=[data,data.data,data.response].find(x=>x&&(Array.isArray(x.gameBoxesList)||Array.isArray(x.outcomeTypes)))||data;
- for(const box of payload.gameBoxesList||[])for(const m of box.matches||[]){if(m?.ID)metadata.set(String(m.ID),{start:stamp(m.startTimestamp),country:/^[A-Za-z]{2}$/.test(m.countryCode||'')?m.countryCode.toUpperCase():''});}
+ for(const box of Array.isArray(payload.gameBoxesList)?payload.gameBoxesList:[])for(const m of Array.isArray(box.matches)?box.matches:[])updateMetadata(m);
  const m=payload.match;
- if(m?.ID){const id=String(m.ID);metadata.set(id,{start:stamp(m.startTimestamp),country:/^[A-Za-z]{2}$/.test(m.countryCode||'')?m.countryCode.toUpperCase():''});
-  // Only explicit full market labels are accepted. Unknown scope IDs are not guessed.
-  const sport=String(m.alias||'');
-  for(const market of payload.outcomeTypes||[]){const name=String(market.name||market.outcome||'');if(!['2-Way Full event','3-Way Ordinary time'].includes(name))continue;
-   const e={id,sport,name:String(m.name||''),competition:String(m.competition||''),participants:(m.ep||[]).map(p=>String(p.name||'')),...metadata.get(id),market:name,at:Date.now(),outcomes:(market.odds||[]).map(o=>({name:String(o.bettingoffer||o.label||''),odds:Number(o.odds),suspended:o.betIsAllowed!==true||o.active===false||Number(o.is_live)===1||/suspend|closed/i.test(String(o.state||''))}))};
+ if(m?.ID){updateMetadata(m);const id=String(m.ID),sport=String(m.alias||'');
+  for(const market of Array.isArray(payload.outcomeTypes)?payload.outcomeTypes:[]){const name=String(market.name||market.outcome||'');if(!['2-Way Full event','3-Way Ordinary time'].includes(name))continue;
+   const e={id,sport,name:String(m.name||''),competition:String(m.competition||''),participants:(Array.isArray(m.ep)?m.ep:[]).map(p=>String(p.name||'')),...metadata.get(id),market:name,at:Date.now(),outcomes:(Array.isArray(market.odds)?market.odds:[]).map(o=>({name:String(o.bettingoffer||o.label||''),odds:Number(o.odds),suspended:o.betIsAllowed!==true||o.active===false||Number(o.is_live)===1||/suspend|closed/i.test(String(o.state||''))}))};
    if(/^[a-z]+(?:-[a-z0-9]+)*$/.test(sport))remember(e);
   }
- }
- lastDOM='';schedule();
+ }schedule();
 }
 function isBookieURL(value){try{const u=new URL(String(value),location.href);return u.origin===location.origin&&u.pathname==='/page.php'&&u.searchParams.get('sid')==='bookieApi';}catch(_){return false;}}
 function hook(){
  const w=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
- try{const f=w.fetch;w.fetch=function(...args){const p=Reflect.apply(f,this,args);if(isBookieURL(args[0]?.url||args[0]))p.then(r=>{if(r.ok)r.clone().json().then(consume).catch(()=>log('Bookie response was not JSON',{},'DEBUG'));},()=>{});return p;};
+ try{const f=w.fetch;if(typeof f==='function')w.fetch=function(...args){const p=Reflect.apply(f,this,args);if(isBookieURL(args[0]?.url||args[0]))p.then(r=>{if(r.ok)r.clone().json().then(consume).catch(()=>log('Bookie response was not JSON',{},'DEBUG'));},()=>{});return p;};
  const proto=w.XMLHttpRequest.prototype,open=proto.open,send=proto.send,urls=new WeakMap();
  proto.open=function(method,url,...rest){urls.set(this,isBookieURL(url));return Reflect.apply(open,this,[method,url,...rest]);};
  proto.send=function(...args){if(urls.get(this))this.addEventListener('load',function(){try{if(this.status===200)consume(this.responseType==='json'?this.response:JSON.parse(this.responseText));}catch(_){log('Bookie capture unavailable',{},'DEBUG');}},{once:true});return Reflect.apply(send,this,args);};
  log('Passive Bookie response capture installed');}catch(_){log('Response hook unavailable; DOM capture remains active',{},'WARN');}
 }
 function schedule(){if(!frame)frame=requestAnimationFrame(()=>{frame=0;if(!document.body)return;mount();scanDOM();render();});}
+function sportFamily(s){const n=norm(s).replace(/ /g,'');return ({football:'soccer',soccer:'soccer',americanfootball:'americanfootball',basketball:'basketball',baseball:'baseball',icehockey:'icehockey',tennis:'tennis',cricket:'cricket',mma:'mma',mixedmartialarts:'mma',boxing:'boxing',rugbyleague:'rugbyleague',rugbyunion:'rugbyunion',aussierules:'aussierules'})[n]||'';}
 function externalMatch(e){
- const candidates=[...external.values()].filter(x=>Math.abs(stamp(x.commence_time)-e.start)<=5*60000&&[x.home_team,x.away_team].map(norm).sort().join('|')===e.participants.map(norm).sort().join('|'));
+ const family=sportFamily(e.sport);if(!family)return null;
+ const candidates=[...external.values()].filter(x=>String(x.sport_key).startsWith(family+'_')&&Math.abs(stamp(x.commence_time)-e.start)<=5*60000&&[x.home_team,x.away_team].map(norm).sort().join('|')===e.participants.map(norm).sort().join('|'));
  if(candidates.length!==1)return null;
  const x=candidates[0],rows=[];
  for(const b of x.bookmakers||[])for(const m of b.markets||[]){if(m.key!=='h2h')continue;const age=Date.now()-stamp(m.last_update||b.last_update);if(!Number.isFinite(age)||age< -30000||age>TTL)continue;
   const out=m.outcomes||[];if(out.length!==e.outcomes.length||out.some(o=>!Number.isFinite(o.price)||o.price<=1)||out.map(o=>norm(o.name)).sort().join('|')!==e.outcomes.map(o=>norm(o.name)).sort().join('|'))continue;
   rows.push({book:b.title||b.key,outcomes:out,at:m.last_update||b.last_update});
- }
- return rows.length?{x,rows}:null;
+ }return rows.length?{x,rows}:null;
 }
-async function request(path,params={},maxAge=TTL){
- const cacheKey=path+'?'+new URLSearchParams(params);const c=cache.get(cacheKey);if(c&&Date.now()-c.at<maxAge)return c.data;
+function quotaText(){return Number.isFinite(quota.remaining)?`${quota.remaining} credits remaining`:'';}
+function readQuota(headers){
+ for(const [field,name]of [['remaining','x-requests-remaining'],['used','x-requests-used'],['last','x-requests-last']]){
+  const value=typeof headers?.get==='function'?headers.get(name):String(headers||'').match(new RegExp('(?:^|\\r?\\n)'+name+':\\s*(\\d+)','i'))?.[1];
+  if(value!==undefined&&value!==null&&/^\d+$/.test(String(value)))quota[field]=Number(value);
+ }
+}
+function providerError(status,data){
+ const code=data&&typeof data==='object'?data.error_code:'';
+ const known={MISSING_KEY:'The external provider did not receive a key.',INVALID_KEY:'The Odds API key is invalid or not associated with a subscription.',DEACTIVATED_KEY:'The Odds API key has been deactivated.',OUT_OF_USAGE_CREDITS:'The external account has no usage credits remaining.',EXCEEDED_FREQ_LIMIT:'The external provider rate limit was reached. Try again later.',INVALID_REGION:'The provider rejected the bookmaker region.',INVALID_MARKET:'The provider does not support the requested market.',INVALID_MARKET_COMBO:'This competition does not support head-to-head odds.',UNKNOWN_SPORT:'The external competition is no longer available.',INVALID_SPORT:'The external competition identifier was rejected.'};
+ if(Object.prototype.hasOwnProperty.call(known,code))return known[code];
+ if(status===401)return 'Key rejected (HTTP 401). Recheck your The Odds API key.';
+ if(status===402)return 'External quota unavailable (HTTP 402). Check your provider account.';
+ if(status===403)return 'Provider denied access (HTTP 403). Check your key and account.';
+ if(status===429)return 'Provider rate limit or quota reached (HTTP 429). Scan stopped; try later.';
+ if(!status)return 'No external response. Check your connection and TornPDA cross-domain request support.';
+ return `External provider returned HTTP ${status}. The scan stopped.`;
+}
+async function request(path,params={},maxAge=TTL,force=false,cacheID=''){
+ const cacheKey=cacheID||path+'?'+new URLSearchParams(params),c=cache.get(cacheKey);
+ if(!force&&c&&Date.now()-c.at<maxAge&&(!params.commenceTimeTo||stamp(c.windowTo)>=Date.now()+DAY)){log('External cache used',{path,count:c.data.length},'DEBUG');return c.data;}
+ // Provider request pacing only. No timer is used to wait for page content.
+ const delay=Math.max(0,250-(Date.now()-lastExternalRequestAt));if(delay)await new Promise(resolve=>setTimeout(resolve,delay));lastExternalRequestAt=Date.now();
  const url=new URL('https://api.the-odds-api.com/v4/'+path);for(const [k,v]of Object.entries({...params,apiKey:key}))url.searchParams.set(k,v);
- let response;
- const gm=typeof GM_xmlhttpRequest==='function'?GM_xmlhttpRequest:typeof GM!=='undefined'&&GM.xmlHttpRequest?GM.xmlHttpRequest.bind(GM):null;
- if(gm)response=await new Promise((resolve,reject)=>gm({method:'GET',url:url.href,anonymous:true,timeout:20000,onload:r=>resolve({status:r.status,text:r.responseText}),onerror:()=>reject(new Error('External network request failed')),ontimeout:()=>reject(new Error('External request timed out'))}));
- else{const r=await fetch(url.href,{credentials:'omit',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(20000)});response={status:r.status,text:await r.text()};}
- if(response.status!==200)throw new Error('External provider HTTP '+response.status+'. Check key or quota.');
- let data;try{data=JSON.parse(response.text);}catch(_){throw new Error('Provider returned invalid JSON');}
- if(!Array.isArray(data))throw new Error('Unexpected external response');
- cache.set(cacheKey,{at:Date.now(),data});log('External response',{path,count:data.length});return data;
+ log('External request started',{path,region:params.regions||null});
+ try{
+  const gm=typeof GM_xmlhttpRequest==='function'?GM_xmlhttpRequest:typeof GM!=='undefined'&&typeof GM.xmlHttpRequest==='function'?GM.xmlHttpRequest.bind(GM):null;
+  let response;
+  if(gm)response=await new Promise((resolve,reject)=>{
+   let done=false,handle;const finish=(error,r)=>{if(done)return;done=true;clearTimeout(timer);error?reject(error):resolve({status:r.status,text:r.responseText??r.response,headers:r.responseHeaders});};
+   // Network watchdog only, never used for DOM discovery.
+   const timer=setTimeout(()=>{finish(new Error('External request timed out after 20 seconds.'));try{handle?.abort?.();}catch(_){}},20000);
+   try{handle=gm({method:'GET',url:url.href,anonymous:true,timeout:20000,onload:r=>finish(null,r),onerror:()=>finish(new Error(providerError(0))),ontimeout:()=>finish(new Error('External request timed out after 20 seconds.')),onabort:()=>finish(new Error('External request was cancelled.'))});
+    if(handle&&typeof handle.then==='function')handle.then(r=>{if(r&&typeof r==='object'&&'status'in r)finish(null,r);},()=>finish(new Error(providerError(0))));
+   }catch(_){finish(new Error(providerError(0)));}
+  });
+  else{
+   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);
+   try{const r=await fetch(url.href,{credentials:'omit',referrerPolicy:'no-referrer',signal:controller.signal});response={status:r.status,text:await r.text(),headers:r.headers};}
+   catch(_){throw new Error(controller.signal.aborted?'External request timed out after 20 seconds.':providerError(0));}finally{clearTimeout(timer);}
+  }
+  readQuota(response.headers);
+  let data;try{data=typeof response.text==='string'?JSON.parse(response.text):response.text;}catch(_){if(response.status!==200)throw new Error(providerError(response.status));throw new Error('External provider returned invalid JSON.');}
+  if(response.status!==200)throw new Error(providerError(response.status,data));
+  if(!Array.isArray(data))throw new Error('External provider returned an unexpected response.');
+  cache.set(cacheKey,{at:Date.now(),windowTo:params.commenceTimeTo,data});log('External response',{path,status:response.status,count:data.length,...quota});return data;
+ }catch(e){log('External request failed',{path,reason:e.message},'WARN');throw e;}
 }
-async function loadSports(){if(busy)return;if(!key){note('Enter your The Odds API key in Settings first. No Torn API key is needed.');return;}busy=true;try{catalog=await request('sports/',{},DAY);providerStatus=`${catalog.filter(s=>s.active&&!s.has_outrights).length} active match competitions available. Refresh external odds scans each one, using provider credits.`;render();}catch(e){note(e.message);}finally{busy=false;}}
+async function activateKey(){
+ const entered=fields.key.value.trim();if(!entered)throw new Error('Paste your The Odds API key in External odds settings.');
+ if(/[\s\u0000-\u001f\u007f]/.test(entered)||entered.length>256)throw new Error('The key contains spaces or invalid characters. Paste only the key.');
+ if(entered!==key){cache.clear();external.clear();catalog=[];quota={};externalLoaded=false;scanComplete=false;key=entered;}
+ if(cfg.providerRegion!==fields.providerRegion.value){external.clear();externalLoaded=false;scanComplete=false;cfg.providerRegion=fields.providerRegion.value;}
+ fields.key.value=key;
+ const saved=await put('key',rememberBox.checked?key:'',true);await savePrefs();
+ return rememberBox.checked?(saved?'Key saved.':'Key active for this session; protected storage unavailable.'):(saved?'Key active for this session.':'Key active for this session; any older saved key could not be cleared.');
+}
+function setBusy(value){busy=value;for(const n of [testButton,externalButton,fields.key,fields.providerRegion,rememberBox])if(n)n.disabled=value;if(stopButton){stopButton.hidden=!value;stopButton.disabled=stopped;}render();}
+async function loadSports(){
+ if(busy)return;stopped=false;setBusy(true);note('');
+ try{keyStatus='Testing key...';render();const saved=await activateKey();catalog=await request('sports/',{},DAY,true);
+  const count=catalog.filter(s=>s.active&&!s.has_outrights).length;keyStatus=`Key verified. ${saved}`;providerStatus=`${count} active competitions. ${quotaText()||'Quota headers unavailable.'}`;
+  log('External key verified',{competitions:count,...quota});
+ }catch(e){keyStatus=e.message;providerStatus='External setup needs attention.';}
+ finally{setBusy(false);}
+}
 async function refreshExternal(){
- if(busy)return;if(!key||!catalog.length){note('Save an external key, then click Load external sports first.');return;}
- busy=true;stopped=false;external.clear();let done=0;const sports=catalog.filter(s=>s.active&&!s.has_outrights),from=new Date(),to=new Date(from.getTime()+DAY);
- try{for(const s of sports){if(stopped)break;providerStatus=`External scan ${done}/${sports.length}. Stop is available.`;render();
-  const rows=await request('sports/'+encodeURIComponent(s.key)+'/odds/',{regions:cfg.providerRegion,markets:'h2h',oddsFormat:'decimal',dateFormat:'iso',commenceTimeFrom:from.toISOString().replace(/\.\d{3}Z$/,'Z'),commenceTimeTo:to.toISOString().replace(/\.\d{3}Z$/,'Z')});
-  for(const x of rows)if(x.id&&x.home_team&&x.away_team)external.set(x.id,x);done++;
- }providerStatus=`External scan ${stopped?'stopped':'finished'}: ${done}/${sports.length} competitions, ${external.size} fixtures. Provider coverage is not every world event.`;
- }catch(e){providerStatus=`Partial external scan ${done}/${sports.length}: ${e.message}`;log('External scan stopped',{completed:done},'WARN');}
- finally{busy=false;render();}
+ if(busy)return;stopped=false;setBusy(true);note('');let done=0,sports=[];
+ try{
+  const saved=await activateKey();catalog=await request('sports/',{},DAY);keyStatus=`Key verified. ${saved}`;
+  sports=catalog.filter(s=>s.active&&!s.has_outrights&&typeof s.key==='string');
+  if(stopped){providerStatus='External scan stopped before odds requests.';return;}
+  if(!sports.length){providerStatus='No active external match competitions were returned.';return;}
+  external.clear();externalLoaded=false;scanComplete=false;
+  for(const s of sports){
+   if(stopped)break;const cacheID=`odds:${s.key}:${cfg.providerRegion}`,cached=cache.get(cacheID);
+   if(quota.remaining===0&&!(cached&&Date.now()-cached.at<TTL))throw new Error('No external credits remaining. Scan stopped.');
+   providerStatus=`Checking external odds: ${done}/${sports.length} competitions`;render();
+   // Extra TTL at the end makes cached responses cover the whole next-24h window.
+   const from=Date.now(),rows=await request('sports/'+encodeURIComponent(s.key)+'/odds/',{regions:cfg.providerRegion,markets:'h2h',oddsFormat:'decimal',dateFormat:'iso',commenceTimeFrom:new Date(from).toISOString().replace(/\.\d{3}Z$/,'Z'),commenceTimeTo:new Date(from+DAY+TTL).toISOString().replace(/\.\d{3}Z$/,'Z')},TTL,false,cacheID);
+   for(const x of rows)if(x&&x.id&&x.home_team&&x.away_team)external.set(x.id,{...x,sport_key:x.sport_key||s.key});
+   externalLoaded=true;done++;
+  }
+  scanComplete=!stopped&&done===sports.length;
+  providerStatus=`External ${scanComplete?'checked':'stopped'}: ${done}/${sports.length} competitions, ${external.size} fixtures.`;
+  log('External scan finished',{completed:done,total:sports.length,fixtures:external.size,partial:!scanComplete,...quota});
+ }catch(e){providerStatus=`External scan stopped (${done}/${sports.length}): ${e.message}`;keyStatus=done?keyStatus:e.message;log('External scan stopped',{completed:done,total:sports.length},'WARN');
+  if(!key){showSettings(true);externalSettings.open=true;}
+ }finally{setBusy(false);}
 }
-function updateOptions(box,values,selected){const sig=JSON.stringify([values,selected]);if(box.dataset.sig===sig)return;box.dataset.sig=sig;box.replaceChildren();for(const [value,label]of values){const o=el('option',label);o.value=value;o.selected=selected.includes(value);box.append(o);}}
-function render(){if(!resultBox)return;
- const now=Date.now(),ranked=rankings(now);resultBox.replaceChildren();
- resultBox.append(el('p',`Coverage: ${metadata.size} event records seen; ${events.size} complete markets captured. Torn coverage is PARTIAL. Open sports and expand matches to collect their winner markets.`,'coverage'));
- resultBox.append(el('p',`Next 24 hours. Top five by normalized Torn implied probability. Prices expire after 5 minutes. Estimates are not measured win rates.`));
- for(const [i,q]of ranked.entries()){
-  const card=el('article'),a=el('a',`${i+1}. ${q.e.name}`,'match');a.href='https://www.torn.com/page.php?sid=bookie#/'+encodeURIComponent(q.e.sport)+'/'+q.e.id;card.append(a);
-  card.append(el('div',q.e.competition+' | '+new Date(q.e.start).toLocaleString()));
-  card.append(el('div',`Favorite: ${q.favorite.name} x${q.favorite.odds.toFixed(2)} | Underdog: ${q.underdog.name} x${q.underdog.odds.toFixed(2)}`,'torn'));
-  card.append(el('div',`Torn implied estimate: ${(q.p*100).toFixed(1)}% | observed ${new Date(q.e.at).toLocaleTimeString()}`,'torn'));
-  const match=externalMatch(q.e);
-  if(match){const details=el('details'),summary=el('summary',`External odds: ${match.rows.length} bookmaker(s)`,'web');details.append(summary);
-   details.append(el('p','Names, start time and outcome set match. Settlement rules and league identity are not independently verified; these quotes do not change the ranking.','web'));
-   for(const row of match.rows){details.append(el('div',`${row.book}: ${row.outcomes.map(o=>o.name+' x'+o.price.toFixed(2)).join(' / ')} | ${new Date(row.at).toLocaleTimeString()}`,'web'));}card.append(details);
-  }else card.append(el('div','External odds: no fresh, unambiguous match.','web'));
-  resultBox.append(card);
+function updateOptions(box,values,selected){
+ const sig=JSON.stringify(values);if(box.dataset.options===sig)return;
+ const chosen=box.dataset.options===undefined?selected:[...box.selectedOptions].map(o=>o.value);
+ // Preserve unsaved choices, including temporarily absent options.
+ const prior=new Map([...box.options].map(o=>[o.value,o.textContent]));
+ for(const value of chosen)if(!values.some(v=>v[0]===value))values.push([value,prior.get(value)||value]);
+ box.dataset.options=JSON.stringify(values);box.replaceChildren();
+ for(const [value,label]of values){const o=el('option',label);o.value=value;o.selected=chosen.includes(value);box.append(o);}
+}
+function unmatchedLabel(){return !externalLoaded?(busy?'External: checking...':'External: not checked.'):(scanComplete?'External: no fresh matching quote.':'External: no match in loaded data.');}
+function render(){
+ if(!root)return;const now=Date.now(),ranked=rankings(now),matched=ranked.map(q=>externalMatch(q.e));
+ const seen=new Set([...seenIDs,...metadata.keys()]).size,fresh=[...events.values()].filter(e=>now-e.at<=TTL&&e.start>now).length;
+ text(coverageBox,`${fresh} fresh markets · ${seen} events seen · PARTIAL`);
+ text(coverageDetails,`${events.size} complete markets captured this session; ${visibleCards} cards currently loaded, ${expandedCards} with winner markets expanded. Open sports and expand matches to collect more. Capture is partial, never all Torn events. Prices expire after 5 minutes. Reopen a market to observe it again.`);
+ text(keyStatusBox,keyStatus);
+ text(providerBox,providerStatus);
+ const count=catalog.filter(s=>s.active&&!s.has_outrights).length;
+ text(providerSettingsBox,[providerStatus,quotaText(),count?`A full scan can cost up to ${count} credits before cached responses. Key tests use no odds credits.`:'Key testing loads the sports catalog without using odds credits.'].filter(Boolean).join(' '));
+ const sig=JSON.stringify([ranked,matched,unmatchedLabel()]);
+ if(sig!==lastRender){
+  lastRender=sig;const opened=new Set([...resultBox.querySelectorAll('details[open]')].map(n=>n.dataset.event));resultBox.replaceChildren();
+  for(const [i,q]of ranked.entries()){
+   const card=el('article'),a=el('a',`${i+1}. ${q.e.name}`,'twsl-match');a.href='https://www.torn.com/page.php?sid=bookie#/'+encodeURIComponent(q.e.sport)+'/'+q.e.id;card.append(a);
+   card.append(el('div',`${q.favorite.name} x${q.favorite.odds.toFixed(2)} · Opponent x${q.underdog.odds.toFixed(2)}`,'twsl-torn'));
+   card.append(el('div',`${(q.p*100).toFixed(1)}% Torn implied · ${new Date(q.e.start).toLocaleString(undefined,{weekday:'short',hour:'2-digit',minute:'2-digit'})}`,'twsl-torn'));
+   const match=matched[i];card.append(el('div',match?`External: ${match.rows.length} matching bookmaker${match.rows.length===1?'':'s'}.`:unmatchedLabel(),'twsl-web'));
+   const details=el('details');details.dataset.event=q.e.id;details.open=opened.has(q.e.id);details.append(el('summary','Details and quotes'));
+   details.append(el('div',q.e.competition),el('div',`Starts: ${new Date(q.e.start).toLocaleString()} (device time)`),el('div',`Opponent: ${q.underdog.name} x${q.underdog.odds.toFixed(2)}`,'twsl-torn'),el('div',`Observed: ${new Date(q.e.at).toLocaleTimeString()} · ${q.e.market}`,'twsl-torn'));
+   if(match){for(const row of match.rows)details.append(el('p',`${row.book}: ${row.outcomes.map(o=>o.name+' x'+o.price.toFixed(2)).join(' / ')} · ${new Date(row.at).toLocaleTimeString()}`,'twsl-web'));
+    details.append(el('p','Sport, names, start and outcome set match. League and settlement equivalence are unverified; external quotes do not change ranking.','twsl-web'));
+   }else details.append(el('p','External coverage can omit competitions. Name differences, ambiguous fixtures, stale prices or different outcome sets also prevent a match.','twsl-web'));
+   card.append(details);resultBox.append(card);
+  }
+  if(!ranked.length)resultBox.append(el('p',fresh?'No captured markets meet your filters.':'Open a Bookie match to capture a fresh winner market.'));
  }
- if(!ranked.length)resultBox.append(el('p','No verified qualifying matches in the captured data. This does not mean there are none elsewhere in Bookie.'));
- resultBox.append(el('p',providerStatus,'web'));
- const sports=[...new Set([...events.values()].map(e=>e.sport))].sort().map(s=>[s,s]);
- updateOptions(sportBox,sports,cfg.sports);const unique=[...new Map([...events.values()].map(e=>[e.id,e])).values()];updateOptions(eventBox,unique.map(e=>[e.id,e.name]),cfg.events);
- root.classList.toggle('mini',cfg.collapsed);clamp();
+ const unique=[...new Map([...events.values()].map(e=>[e.id,e])).values()];
+ updateOptions(sportBox,[...new Set(unique.map(e=>e.sport))].sort().map(s=>[s,s]),cfg.sports);
+ updateOptions(eventBox,unique.map(e=>[e.id,e.name]),cfg.events);
+ root.dataset.twslView=cfg.collapsed?'collapsed':'expanded';clamp();
 }
-function clamp(){if(!root)return;const w=root.offsetWidth,h=root.offsetHeight;cfg.x=Math.max(0,Math.min(Number(cfg.x)||0,innerWidth-w));cfg.y=Math.max(0,Math.min(Number(cfg.y)||0,innerHeight-Math.min(h,innerHeight)));root.style.left=cfg.x+'px';root.style.top=cfg.y+'px';}
+function clamp(){if(!root)return;const viewport=window.visualViewport,w=viewport?.width||innerWidth,h=viewport?.height||innerHeight;
+ cfg.x=Math.max(0,Math.min(Number(cfg.x)||0,w-root.offsetWidth));cfg.y=Math.max(0,Math.min(Number(cfg.y)||0,h-Math.min(root.offsetHeight,h)));root.style.left=cfg.x+'px';root.style.top=cfg.y+'px';}
 function drag(handle){let d=null,ignore=false;
- handle.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('button')&&e.target!==handle)return;d={id:e.pointerId,x:e.clientX,y:e.clientY,left:cfg.x,top:cfg.y,moved:false};handle.setPointerCapture(e.pointerId);});
+ handle.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('button')&&e.target!==handle)return;ignore=false;d={id:e.pointerId,x:e.clientX,y:e.clientY,left:cfg.x,top:cfg.y,moved:false};try{handle.setPointerCapture(e.pointerId);}catch(_){} });
  handle.addEventListener('pointermove',e=>{if(!d||d.id!==e.pointerId)return;const dx=e.clientX-d.x,dy=e.clientY-d.y;if(Math.hypot(dx,dy)>5)d.moved=true;if(d.moved){cfg.x=d.left+dx;cfg.y=d.top+dy;clamp();}});
- const end=e=>{if(!d||d.id!==e.pointerId)return;ignore=d.moved;d=null;void put('settings',cfg);};handle.addEventListener('pointerup',end);handle.addEventListener('pointercancel',end);
+ const end=e=>{if(!d||d.id!==e.pointerId)return;ignore=d.moved;d=null;void savePrefs();};handle.addEventListener('pointerup',end);handle.addEventListener('pointercancel',end);
  handle.addEventListener('click',e=>{if(ignore){e.preventDefault();e.stopImmediatePropagation();ignore=false;}},true);
 }
+function showSettings(open){settings.hidden=!open;home.hidden=open;gearButton.setAttribute('aria-expanded',String(open));body.scrollTop=0;clamp();}
+function field(parent,name,label,type,value){
+ const wrap=el('label',label),n=el('input');n.type=type;n.id='twsl-'+name;n.value=value;n.autocomplete='off';wrap.htmlFor=n.id;wrap.append(n);parent.append(wrap);fields[name]=n;return n;
+}
+function select(parent,name,label,options,value){
+ const wrap=el('label',label),n=el('select');n.id='twsl-'+name;wrap.htmlFor=n.id;for(const [v,t]of options){const o=el('option',t);o.value=v;n.append(o);}if(value!==null)n.value=value;wrap.append(n);parent.append(wrap);fields[name]=n;return n;
+}
+function group(parent,label,open=false){const d=el('details');d.open=open;d.append(el('summary',label));parent.append(d);return d;}
+function syncCountry(){const active=fields.region.value==='country';fields.country.disabled=!active;fields.country.parentElement.hidden=!active;}
+async function saveFilters(){
+ const min=Number(fields.min.value),max=Number(fields.max.value),dog=Number(fields.dog.value),country=fields.country.value.trim().toUpperCase();
+ if(![min,max,dog].every(x=>Number.isFinite(x)&&x>1&&x<=1e6)||min>max){text(filterStatusBox,'Use multipliers greater than 1, with minimum no larger than maximum.');return;}
+ if(fields.region.value==='country'&&!/^[A-Z]{2}$/.test(country)){text(filterStatusBox,'Enter a two-letter country code, such as GB or BR.');fields.country.focus();return;}
+ cfg={...cfg,min,max,dog,country,sex:fields.sex.value,region:fields.region.value,sports:[...sportBox.selectedOptions].map(o=>o.value),events:[...eventBox.selectedOptions].map(o=>o.value)};
+ const saved=await savePrefs();text(filterStatusBox,saved?'Filters saved.':'Filters applied for this session; saving failed.');log('Filters applied',{sports:cfg.sports.length,events:cfg.events.length,countryMode:cfg.region});render();
+}
 function mount(){
- if(root){if(!root.isConnected)document.body.append(root);return;}
- const style=el('style');style.textContent=`
- #tw-shortlist{position:fixed;width:380px;max-width:calc(100vw - 12px);z-index:2147483638;background:#151c27;color:#e5eaf2;border:1px solid #53647d;border-radius:12px;box-shadow:0 8px 28px #0009;font:13px/1.45 Arial,sans-serif;box-sizing:border-box;overflow:hidden}
- #tw-shortlist *{box-sizing:border-box}#tw-shortlist .bar{display:flex;align-items:center;gap:6px;padding:7px;background:#24334b;touch-action:none;cursor:move;user-select:none}
- #tw-shortlist .bar strong{flex:1}#tw-shortlist button,#tw-shortlist input,#tw-shortlist select{font:inherit;background:#26344a;color:#fff;border:1px solid #718199;border-radius:5px;padding:7px;min-height:40px;max-width:100%}
- #tw-shortlist button{cursor:pointer;touch-action:manipulation}#tw-shortlist .body{padding:10px;max-height:70vh;overflow:auto;overscroll-behavior:contain}
- #tw-shortlist p{margin:7px 0}#tw-shortlist article{padding:10px 0;border-bottom:1px solid #445268}#tw-shortlist .torn{color:#b7b7b7}#tw-shortlist .web{color:#a4d8f4}#tw-shortlist .coverage{color:#f0c67f}
- #tw-shortlist a.match{display:block;color:#0047ab!important;background:#e4edff;padding:6px;border-radius:5px;font-weight:bold;text-decoration:underline;overflow-wrap:anywhere}
- #tw-shortlist label{display:block;margin:10px 0}#tw-shortlist label>*{display:block;width:100%;margin-top:4px}#tw-shortlist .actions{display:flex;flex-wrap:wrap;gap:5px}#tw-shortlist [hidden]{display:none!important}
- #tw-shortlist.mini{width:48px;border-radius:50%;height:48px}#tw-shortlist.mini .body,#tw-shortlist.mini .bar{display:none}#tw-shortlist .token{display:none;width:48px;height:48px;border:0;font-size:25px;touch-action:none}#tw-shortlist.mini .token{display:block}
- #tw-shortlist #tw-shortlist-support{position:static!important;inset:auto!important;width:100%!important;margin-top:12px}#tw-shortlist button:focus-visible{outline:2px solid #a4d8f4}
- `;document.documentElement.append(style);
+ if(root){if(!uiStyle.isConnected)document.documentElement.append(uiStyle);if(!root.isConnected)document.body.append(root);return;}
+ uiStyle=el('style');uiStyle.id='twsl-ui-css';uiStyle.textContent=`
+ #tw-shortlist{position:fixed;width:380px;max-width:calc(100vw - 16px);z-index:2147483638;background:#151c27;color:#e5eaf2;border:1px solid #53647d;border-radius:12px;box-shadow:0 8px 28px #0009;font:13px/1.45 Arial,sans-serif;box-sizing:border-box;overflow:hidden}
+ #tw-shortlist *{box-sizing:border-box}#tw-shortlist .twsl-bar{display:flex;align-items:center;gap:6px;padding:6px 8px;background:#24334b;touch-action:none;cursor:move;user-select:none}
+ #tw-shortlist .twsl-bar strong{flex:1}#tw-shortlist button,#tw-shortlist input,#tw-shortlist select{font:inherit;background:#26344a;color:#fff;border:1px solid #718199;border-radius:5px;padding:7px;min-height:40px;max-width:100%}
+ #tw-shortlist button{cursor:pointer;touch-action:manipulation}#tw-shortlist button:disabled{opacity:.55;cursor:default}#tw-shortlist .twsl-body{padding:10px;max-height:62vh;max-height:62dvh;overflow:auto;overscroll-behavior:contain}
+ #tw-shortlist p{margin:6px 0}#tw-shortlist article{padding:9px 0;border-bottom:1px solid #445268}#tw-shortlist .twsl-torn{color:#b7b7b7}#tw-shortlist .twsl-web{color:#a4d8f4}#tw-shortlist .twsl-coverage{color:#f0c67f;font-size:12px;margin:7px 0}
+ #tw-shortlist a.twsl-match{display:block;color:#0047ab!important;background:#e4edff;padding:6px;border-radius:5px;font-weight:bold;text-decoration:underline;overflow-wrap:anywhere;margin-bottom:4px}
+ #tw-shortlist label{display:block;margin:9px 0}#tw-shortlist label>input:not([type=checkbox]),#tw-shortlist label>select{display:block;width:100%;margin-top:4px}
+ #tw-shortlist label.twsl-check{display:flex;align-items:center;gap:8px;min-height:40px}#tw-shortlist input[type=checkbox]{width:20px;height:20px;min-height:20px;margin:0;flex:none;accent-color:#458cff;order:-1}
+ #tw-shortlist .twsl-actions{display:flex;flex-wrap:wrap;gap:6px;margin:5px 0}#tw-shortlist .twsl-numbers{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}#tw-shortlist .twsl-numbers input{min-width:0}
+ #tw-shortlist summary{cursor:pointer;min-height:40px;display:list-item;padding:8px 0;color:#c6dbf5}#tw-shortlist details{margin:5px 0}#tw-shortlist details>details{padding-left:8px}#tw-shortlist [role=status]{overflow-wrap:anywhere}#tw-shortlist [hidden]{display:none!important}
+ #tw-shortlist[data-twsl-view=collapsed]{width:48px;height:48px;border-radius:50%}#tw-shortlist[data-twsl-view=collapsed]>.twsl-bar,#tw-shortlist[data-twsl-view=collapsed]>.twsl-body{display:none}
+ #tw-shortlist-token{display:none;width:48px;height:48px;border:0!important;font-size:25px!important;touch-action:none}#tw-shortlist[data-twsl-view=collapsed]>#tw-shortlist-token{display:block}
+ #tw-shortlist #tw-shortlist-support{position:static!important;inset:auto!important;width:100%!important;margin-top:12px}#tw-shortlist button:focus-visible,#tw-shortlist summary:focus-visible{outline:2px solid #a4d8f4}
+ `;document.documentElement.append(uiStyle);
  root=el('section');root.id='tw-shortlist';root.setAttribute('aria-label','Bookie shortlist');
- const token=button('🎟️',()=>{cfg.collapsed=false;render();void put('settings',cfg);});token.className='token';token.title='Open Bookie shortlist; drag to move';drag(token);
- const bar=el('div',undefined,'bar');bar.append(el('strong','🎟️ Bookie shortlist'),button('⚙️',()=>{settings.open=!settings.open;clamp();}),button('−',()=>{cfg.collapsed=true;render();void put('settings',cfg);}));drag(bar);
- const body=el('div',undefined,'body');statusBox=el('div','Open Bookie matches to capture their markets.');statusBox.setAttribute('role','status');
- const actions=el('div',undefined,'actions');actions.append(button('Recheck captured',()=>{lastDOM='';schedule();}),button('External sports',()=>void loadSports()),button('Refresh external',()=>void refreshExternal()),button('Stop',()=>{stopped=true;}));
- resultBox=el('div');settings=el('details');settings.append(el('summary','Settings and support'));
- const fields={};function field(name,label,type,value){const wrap=el('label',label),n=el('input');n.type=type;n.value=value;n.autocomplete='off';wrap.append(n);settings.append(wrap);fields[name]=n;return n;}
- function select(name,label,options,value){const wrap=el('label',label),n=el('select');for(const [v,t]of options){const o=el('option',t);o.value=v;n.append(o);}n.value=value;wrap.append(n);settings.append(wrap);fields[name]=n;return n;}
- for(const [k,t]of [['min','Favorite minimum multiplier'],['max','Favorite maximum multiplier'],['dog','Underdog minimum multiplier']]){const n=field(k,t,'number',cfg[k]);n.step='0.01';n.min='1.01';}
- select('sex','Event category',[['both','Both, including unknown'],['men','Men only, explicitly identified'],['women','Women only, explicitly identified']],cfg.sex);
- select('region','Country filter (event country, not team nationality)',[['all','All countries, including unknown'],['us','United States'],['country','Specific country'],['international','Outside US, known countries only']],cfg.region);
- field('country','Specific country: two-letter code, e.g. GB, BR','text',cfg.country).maxLength=2;
- sportBox=select('sports','Sports: no selection means ALL captured sports',[],null);sportBox.multiple=true;sportBox.size=4;
- eventBox=select('events','Matches: no selection means ALL captured matches',[],null);eventBox.multiple=true;eventBox.size=4;
- settings.append(button('Select ALL sports and matches',()=>{for(const box of [sportBox,eventBox])for(const o of box.options)o.selected=false;}));
- field('key','The Odds API key (optional, not a Torn key)','password',key);
- select('providerRegion','External bookmaker region (not event country)',[['eu','Europe'],['uk','United Kingdom'],['us','US'],['au','Australia']],cfg.providerRegion);
- const rememberKey=field('remember','Remember external key in userscript storage','checkbox','');rememberKey.checked=false;
- settings.append(el('p','Keys go only to The Odds API. If protected userscript storage is unavailable, the key stays in memory. Settings use local storage as fallback. No bets are placed. No personal betting history is sent.'));
- settings.append(button('Save settings',async()=>{
-  const min=Number(fields.min.value),max=Number(fields.max.value),dog=Number(fields.dog.value),country=fields.country.value.trim().toUpperCase();
-  if(![min,max,dog].every(x=>Number.isFinite(x)&&x>1&&x<=1e6)||min>max||! /^[A-Z]{2}$/.test(country)){note('Use valid multipliers greater than 1, minimum no larger than maximum, and a two-letter country code.');return;}
-  if(busy){note('Stop the external scan before changing settings.');return;}
-  cfg={...cfg,min,max,dog,country,sex:fields.sex.value,region:fields.region.value,providerRegion:fields.providerRegion.value,sports:[...sportBox.selectedOptions].map(o=>o.value),events:[...eventBox.selectedOptions].map(o=>o.value)};
-  if(key!==fields.key.value.trim()){cache.clear();external.clear();catalog=[];}key=fields.key.value.trim();
-  const saved=await put('settings',cfg),secretSaved=await put('key',rememberKey.checked?key:'',true);
-  note(saved?'Settings saved.' : 'Settings active for this session; persistent storage failed.');if(rememberKey.checked&&!secretSaved)note('Settings applied. External key is session-only because userscript storage is unavailable.');render();
- }));
- settings.append(button('🪲',()=>MyDebug.toggleView()),button('📋 Copy Logs to Clipboard',function(){void MyDebug.copy(this);}));
- const host=el('div');host.id='tw-shortlist-support-host';settings.append(host);body.append(statusBox,actions,resultBox,settings);root.append(token,bar,body);document.body.append(root);
- support=new SupportModule({containerId:'tw-shortlist-support',styleId:'tw-shortlist-support-css',getParent:()=>host});
- clamp();
+ const token=button('🎟️',()=>{cfg.collapsed=false;render();void savePrefs();});token.id='tw-shortlist-token';token.title='Open Bookie shortlist; drag to move';token.setAttribute('aria-label','Open Bookie shortlist');drag(token);
+ const bar=el('div',undefined,'twsl-bar');gearButton=button('⚙️',()=>showSettings(settings.hidden));gearButton.id='twsl-settings-toggle';gearButton.title='Settings';gearButton.setAttribute('aria-label','Settings');gearButton.setAttribute('aria-expanded','false');
+ const minimize=button('−',()=>{cfg.collapsed=true;render();void savePrefs();});minimize.setAttribute('aria-label','Minimize shortlist');bar.append(el('strong','🎟️ Bookie shortlist'),gearButton,minimize);drag(bar);
+ body=el('div',undefined,'twsl-body');home=el('div');settings=el('section');settings.hidden=true;
+ statusBox=el('div');statusBox.setAttribute('role','status');statusBox.hidden=true;
+ const actions=el('div',undefined,'twsl-actions');externalButton=button('Check external odds',()=>void refreshExternal());externalButton.id='twsl-check-external';
+ const recheck=button('Recheck',()=>{scanDOM();render();note('Captured data rechecked. Open or reopen matches to capture prices.');});recheck.title='Recheck loaded markets; this does not request new prices';
+ stopButton=button('Stop',()=>{stopped=true;stopButton.disabled=true;providerStatus='Stopping after the current request...';render();});stopButton.id='twsl-stop';stopButton.hidden=true;bar.insertBefore(stopButton,gearButton);
+ actions.append(externalButton,recheck);coverageBox=el('div',undefined,'twsl-coverage');resultBox=el('div');providerBox=el('p',undefined,'twsl-web');providerBox.setAttribute('role','status');
+ home.append(statusBox,actions,coverageBox,resultBox,providerBox);
+ const about=group(home,'Coverage and method');coverageDetails=el('p');about.append(coverageDetails,el('p','Next 24 hours, up to five matches. Rank uses normalized Torn implied probability, including draw odds. This is an estimate, not a measured win rate.'));
+ settings.append(button('← Back to shortlist',()=>showSettings(false)),el('p','Version '+VERSION));
+ externalSettings=group(settings,'External odds',true);
+ const keyField=field(externalSettings,'key','The Odds API key (optional)','password',key);keyField.spellcheck=false;keyField.setAttribute('autocapitalize','none');
+ keyField.addEventListener('input',()=>{keyStatus=keyField.value.trim()===key?(key?'Saved key loaded.':'No key saved.'):'Key edited. Tap Save & test key.';render();});
+ rememberBox=field(externalSettings,'remember','Remember key on this device','checkbox','');rememberBox.checked=!!key;rememberBox.parentElement.className='twsl-check';
+ select(externalSettings,'providerRegion','Bookmaker region',[['eu','Europe'],['uk','United Kingdom'],['us','US'],['au','Australia']],cfg.providerRegion);
+ const keyActions=el('div',undefined,'twsl-actions');testButton=button('Save & test key',()=>void loadSports());testButton.id='twsl-test-key';
+ const forgetButton=button('Forget key',async()=>{if(busy)return;key='';fields.key.value='';rememberBox.checked=false;cache.clear();external.clear();catalog=[];quota={};externalLoaded=false;scanComplete=false;keyStatus=await put('key','',true)?'Key removed.':'Key removed from session; storage could not be cleared.';providerStatus='External: not checked.';render();});
+ keyActions.append(testButton,forgetButton);keyStatusBox=el('p',undefined,'twsl-web');keyStatusBox.setAttribute('role','status');providerSettingsBox=el('p',undefined,'twsl-web');externalSettings.append(keyActions,keyStatusBox,providerSettingsBox);
+ const filters=group(settings,'Shortlist filters');const numbers=el('div',undefined,'twsl-numbers');filters.append(numbers);
+ for(const [k,t]of [['min','Favorite min'],['max','Favorite max'],['dog','Opponent min']]){const n=field(numbers,k,t,'number',cfg[k]);n.step='0.01';n.min='1.01';n.inputMode='decimal';}
+ select(filters,'sex','Event category',[['both','Both, including unknown'],['men','Men only, explicitly identified'],['women','Women only, explicitly identified']],cfg.sex);
+ select(filters,'region','Event country (not team nationality)',[['all','All countries, including unknown'],['us','United States'],['country','Specific country'],['international','Outside US, known countries only']],cfg.region).addEventListener('change',syncCountry);
+ field(filters,'country','Two-letter country code, e.g. GB, BR','text',cfg.country).maxLength=2;syncCountry();
+ const selections=group(filters,'Choose sports or matches');sportBox=select(selections,'sports','Sports: none selected means all',[],null);sportBox.multiple=true;sportBox.size=4;
+ eventBox=select(selections,'events','Matches: none selected means all',[],null);eventBox.multiple=true;eventBox.size=4;
+ selections.append(button('Use all sports and matches',()=>{for(const box of [sportBox,eventBox])for(const o of box.options)o.selected=false;}));
+ filterStatusBox=el('p');filterStatusBox.setAttribute('role','status');const saveButton=button('Save filters',()=>void saveFilters());saveButton.id='twsl-save-filters';filters.append(saveButton,filterStatusBox);
+ const diagnostics=group(settings,'Diagnostics and support'),debugActions=el('div',undefined,'twsl-actions');debugActions.append(button('🪲',()=>MyDebug.toggleView()),button('📋 Copy Logs to Clipboard',function(){void MyDebug.copy(this);}));diagnostics.append(debugActions);
+ const host=el('div');host.id='tw-shortlist-support-host';diagnostics.append(host);
+ const privacy=group(settings,'Storage and privacy');privacy.append(el('p','No Torn key is needed. The external key goes only to The Odds API. Remember stores it in userscript storage, if available. Preferences can use localStorage. No bets are placed or betting history sent. Uncheck Remember and Save & test to remove a stored key while using it this session.'));
+ body.append(home,settings);root.append(token,bar,body);document.body.append(root);
+ support=new SupportModule({containerId:'tw-shortlist-support',styleId:'tw-shortlist-support-css',getParent:()=>host});clamp();
+}
+function relevantMutation(m){
+ const n=m.target.nodeType===1?m.target:m.target.parentElement;
+ if(n?.closest('#tw-shortlist,[id^="tw-debug-"],[id^="twsl-"]'))return false;
+ if(n?.closest('.matchName,ul.bets-wrap,li.c-pointer,li.disabled'))return true;
+ return [...m.addedNodes,...m.removedNodes].some(x=>x.nodeType===1&&(x.matches('.matchName,ul.bets-wrap,li.c-pointer')||x.querySelector('.matchName,ul.bets-wrap')));
 }
 hook();
 async function boot(){
- const stored=await get('settings',{});cfg={...defaults,...stored};
+ const stored=await get('settings',{});cfg={...defaults,...(stored&&typeof stored==='object'?stored:{})};
  if(!Array.isArray(cfg.sports))cfg.sports=[];if(!Array.isArray(cfg.events))cfg.events=[];
- if(![cfg.min,cfg.max,cfg.dog].every(x=>Number.isFinite(x)&&x>1)||cfg.min>cfg.max)Object.assign(cfg,{min:1.3,max:2.5,dog:4});
- key=await get('key','',true);if(typeof key!=='string')key='';
+ if(![cfg.min,cfg.max,cfg.dog].every(x=>Number.isFinite(x)&&x>1&&x<=1e6)||cfg.min>cfg.max)Object.assign(cfg,{min:1.3,max:2.5,dog:4});
+ if(!['both','men','women'].includes(cfg.sex))cfg.sex='both';if(!['all','us','country','international'].includes(cfg.region))cfg.region='all';
+ if(!['eu','us','uk','au'].includes(cfg.providerRegion))cfg.providerRegion='eu';cfg.country=String(cfg.country||'').toUpperCase();
+ key=await get('key','',true);if(typeof key!=='string')key='';key=key.trim();keyStatus=key?'Saved key loaded; tap Save & test key to verify it.':'No key saved.';
  mount();scanDOM();render();
- const observer=new MutationObserver(ms=>{if(!root.isConnected||ms.some(m=>{const n=m.target.nodeType===1?m.target:m.target.parentElement;return !n?.closest('#tw-shortlist,[id^="tw-debug-"]')&&[...m.addedNodes,...m.removedNodes].some(x=>x.nodeType===1||x.nodeType===3)||m.type==='characterData'&&!n?.closest('#tw-shortlist,[id^="tw-debug-"]');}))schedule();});
- observer.observe(document.documentElement,{childList:true,subtree:true,characterData:true});
- window.addEventListener('hashchange',()=>{lastDOM='';schedule();});window.addEventListener('resize',clamp);document.addEventListener('visibilitychange',()=>{if(!document.hidden)schedule();});
- // Expiry-only timer, never used to discover DOM elements or fetch data.
+ const observer=new MutationObserver(ms=>{if(!root.isConnected||!uiStyle.isConnected||ms.some(relevantMutation))schedule();});
+ observer.observe(document.documentElement,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:['disabled','aria-disabled','class','title','data-start-timestamp','data-start-time','data-start','datetime','href']});
+ window.addEventListener('hashchange',schedule);window.addEventListener('resize',clamp);window.visualViewport?.addEventListener('resize',clamp);document.addEventListener('visibilitychange',()=>{if(!document.hidden)schedule();});
+ // Expiry-only timer. DOM discovery and requests are never polled.
  window.setInterval(()=>{if(!document.hidden)render();},30000);
- log('Ready',{version:'1.0.1',mode:'partial-coverage'});
+ log('Ready',{version:VERSION,mode:'partial-coverage',keyPresent:!!key});
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>void boot(),{once:true});else void boot();
-/*
-// @grant        GM_addStyle
-// @run-at       document-end
-// ==/UserScript==
 
 /*
  * Donation UI Module
