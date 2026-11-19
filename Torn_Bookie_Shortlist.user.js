@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn_Bookie_Shortlist
 // @namespace    https://github.com/ShavedW00kie/
-// @version      1.0.6
+// @version      1.0.7
 // @description  Two-outcome Bookie profit plans, match-list indicators, local performance journal and optional external odds.
 // @author       ShavedW00kie (Torn: ThaWookie [2954173] )
 // @license      BSD-3-Clause
@@ -24,12 +24,21 @@
 (function (nativeInfo) {
 'use strict';
 if (location.hostname !== 'www.torn.com' || location.pathname !== '/page.php' || new URLSearchParams(location.search).get('sid') !== 'bookie') return;
-const VERSION = '1.0.6';
+const VERSION = '1.0.7';
 const GM_info = {...(nativeInfo || {}), script: {...(nativeInfo?.script || {}), name: 'Torn_Bookie_Shortlist', version: VERSION}};
 const MyDebug = initializeModularDebugger(GM_info.script.name);
 /*
 Install: replace the previous script in Tampermonkey or TornPDA, save, reload
 https://www.torn.com/page.php?sid=bookie. The draggable ticket opens settings.
+
+v1.0.7: body-driven startup does not wait for DOMContentLoaded. The interface
+mounts before storage reads, and diagnostics remain reachable on failures.
+Details open outside native fixed-height rows in an isolated scrollable dialog.
+Automatic favorite protection maximizes favorite payout subject to at least
+10% net on BOTH team wins when feasible; otherwise it seeks a nonnegative
+opponent result with positive favorite net. If impossible, a balanced LOSING
+COMPARISON is shown, never advertised as protected. This is a constrained
+odds calculation, not an independently validated statistical prediction.
 
 v1.0.6: two-outcome winner markets are the default. Draw wagering is removed.
 Old odds thresholds are retained as an optional advanced filter, disabled by
@@ -68,7 +77,9 @@ unverified. External quotes do not alter stakes or positive-return indicators.
 
 No Torn API key or Torn API calls are required. External keys go only to
 api.the-odds-api.com and persist only in userscript storage, if requested.
-Preferences and the journal may fall back to localStorage; keys never do.
+Preferences and the journal may use a localStorage fallback; keys never use
+that fallback. GM storage is controlled by the userscript manager. TornPDA
+compatibility storage may itself use browser storage; it is not a secret vault.
 No betting history is transmitted. Embedded Donation UI v1.4 and debugger
 v1.0.4, with their licenses, are retained below. Live TornPDA validation remains
 necessary; automated fixture tests do not reproduce every native layout.
@@ -77,7 +88,7 @@ const PREFIX = 'tw-shortlist-v1:', TTL = 5 * 60000, DAY = 86400000;
 const HEADING_SELECTOR='.matchName .name p, [class*="matchName___"] .name p, ul.pop-game > li.team .name p';
 const CARD_SELECTOR='li.c-pointer, ul.pop-list > li';
 const MARKET_NAMES=['2-Way Full event','3-Way Ordinary time'];
-const defaults = {min:1.3,max:2.5,dog:4,sex:'both',region:'all',country:'',sports:[],events:[],collapsed:true,x:12,y:90,providerRegion:'eu',inline:true,inlineScope:'all',budget:500000000,splitMode:'balanced',favoriteShare:80,marketScope:'twoWay',oddsFilters:false,indicators:true,trackPaper:false,externalLimit:5};
+const defaults = {min:1.3,max:2.5,dog:4,sex:'both',region:'all',country:'',sports:[],events:[],collapsed:true,x:null,y:null,providerRegion:'eu',inline:true,inlineScope:'all',budget:500000000,splitMode:'protect',favoriteShare:80,planVersion:2,marketScope:'twoWay',oddsFilters:false,indicators:true,trackPaper:false,externalLimit:5};
 let cfg = {...defaults}, key = '', root, uiStyle, body, home, settings, resultBox, statusBox, coverageBox, coverageDetails;
 let keyStatusBox, providerBox, providerSettingsBox, sportBox, eventBox, filterStatusBox, externalSettings, rememberBox;
 let externalButton, stopButton, testButton, gearButton, support;
@@ -98,7 +109,7 @@ async function get(k,d,secret=false){
  const readers=[];if(typeof GM_getValue==='function')readers.push(()=>GM_getValue(PREFIX+k,d));
  if(typeof GM!=='undefined'&&typeof GM.getValue==='function')readers.push(()=>GM.getValue(PREFIX+k,d));
  if(!secret)readers.push(()=>JSON.parse(localStorage.getItem(PREFIX+k)||'null')??d);
- for(const read of readers)try{return (await read())??d;}catch(_){log('Storage read failed',{item:k},'WARN');}return d;
+ let failed=false;for(let i=0;i<readers.length;i++)try{const value=await boundedRead(readers[i]());readState.set(k,failed&&!secret&&i===readers.length-1?'failed':'ok');return value??d;}catch(_){failed=true;log('Storage read failed',{item:k},'WARN');}readState.set(k,readers.length?'failed':'ok');return d;
 }
 async function put(k,v,secret=false){
  const writers=[];if(typeof GM_setValue==='function')writers.push(()=>GM_setValue(PREFIX+k,v));
@@ -106,7 +117,7 @@ async function put(k,v,secret=false){
  if(!secret)writers.push(()=>localStorage.setItem(PREFIX+k,JSON.stringify(v)));
  for(const write of writers)try{await write();return true;}catch(_){log('Storage write failed',{item:k},'WARN');}return false;
 }
-function savePrefs(){const snapshot=JSON.parse(JSON.stringify(cfg));prefsWrite=prefsWrite.then(()=>put('settings',snapshot));return prefsWrite;}
+function savePrefs(){if(!ready||readState.get('settings')==='failed')return Promise.resolve(false);const snapshot=JSON.parse(JSON.stringify(cfg));prefsWrite=prefsWrite.then(()=>put('settings',snapshot));return prefsWrite;}
 function el(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;}
 function button(label,fn){const b=el('button',label);b.type='button';b.addEventListener('click',fn);return b;}
 function text(n,s){if(n&&n.textContent!==s)n.textContent=s;}
@@ -143,10 +154,10 @@ function getPlan(q){
 function rankings(now=Date.now()){
  const best=new Map();for(const e of events.values()){
   const q=qualifying(e,now),p=getPlan(q);if(!q||!p)continue;
-  q.roi=worstNet(p)/p.budget;const prior=best.get(e.id);
+  q.roi=worstNet(p)/p.budget;q.favoriteROI=p.favoriteNet/p.budget;const prior=best.get(e.id);
   if(!prior||q.roi>prior.roi)best.set(e.id,q);
  }
- return [...best.values()].sort((a,b)=>b.roi-a.roi||a.e.start-b.e.start||a.e.id.localeCompare(b.e.id)).slice(0,5);
+ return [...best.values()].sort((a,b)=>b.roi-a.roi||b.favoriteROI-a.favoriteROI||a.e.start-b.e.start||a.e.id.localeCompare(b.e.id)).slice(0,5);
 }
 function decimalRatio(value){
  const s=String(value);if(!/^\d+(?:\.\d+)?$/.test(s))return null;
@@ -154,7 +165,7 @@ function decimalRatio(value){
 }
 
 function stakePlan(q,budget=cfg.budget,mode=cfg.splitMode,share=cfg.favoriteShare){
- if(!q||!Number.isSafeInteger(budget)||budget<2||budget>1000000000||!['balanced','custom'].includes(mode))return null;
+ if(!q||!Number.isSafeInteger(budget)||budget<2||budget>1000000000||!['balanced','custom','protect'].includes(mode))return null;
  const f=decimalRatio(q.favorite.odds),d=decimalRatio(q.underdog.odds),total=BigInt(budget);
  if(!f||!d||f.n<=f.d||d.n<=d.d)return null;
  const draw=q.e.outcomes.find(o=>norm(o.name)==='draw');
@@ -162,7 +173,7 @@ function stakePlan(q,budget=cfg.budget,mode=cfg.splitMode,share=cfg.favoriteShar
   const fp=a*f.n/f.d,dp=b*d.n/d.d,fn=fp-total,dn=dp-total;
   return {a,b,fp,dp,fn,dn,min:fn<dn?fn:dn};};
  let best;
- if(mode==='balanced'){
+ if(mode==='balanced'||mode==='protect'){
   const a=total*d.n*f.d/(f.n*d.d+d.n*f.d);
   for(const candidate of [a,a+1n]){const r=evaluate(candidate);if(r&&(!best||r.min>best.min))best=r;}
  }else{
@@ -170,7 +181,20 @@ function stakePlan(q,budget=cfg.budget,mode=cfg.splitMode,share=cfg.favoriteShar
   best=evaluate((total*BigInt(Math.round(share*100))+5000n)/10000n);
  }
  if(!best)return null;
- return {budget,mode,share,drawCovered:false,favoriteStake:Number(best.a),underdogStake:Number(best.b),favoritePayout:Number(best.fp),underdogPayout:Number(best.dp),favoriteNet:Number(best.fn),underdogNet:Number(best.dn),minimumNet:Number(best.min),drawStake:draw?0:null,drawPayout:draw?0:null,drawNet:draw?-budget:null};
+ let protection=mode==='protect'?'unavailable':'balanced',opponentFloor=null;
+ if(mode==='protect'){
+  const equal=f.n*d.d===d.n*f.d;
+  if(equal){protection=best.min>=0n?'equal':'unavailable';}
+  else{
+   // Smallest whole-dollar opponent stake meeting the required TOTAL payout.
+   // The remainder maximizes the favorite payout under that constraint.
+   const cover=net=>{const payout=total+net,b=(payout*d.d+d.n-1n)/d.n;return evaluate(total-b);};
+   const target=(total+9n)/10n,ten=cover(target),zero=cover(0n);
+   if(ten&&ten.fn>=target&&ten.dn>=target&&ten.a>=ten.b){best=ten;protection='target10';opponentFloor=.10;}
+   else if(zero&&zero.fn>0n&&zero.dn>=0n&&zero.a>=zero.b){best=zero;protection='breakeven';opponentFloor=0;}
+  }
+ }
+ return {budget,mode,share,protection,opponentFloor,drawCovered:false,favoriteStake:Number(best.a),underdogStake:Number(best.b),favoritePayout:Number(best.fp),underdogPayout:Number(best.dp),favoriteNet:Number(best.fn),underdogNet:Number(best.dn),minimumNet:Number(best.min),drawStake:draw?0:null,drawPayout:draw?0:null,drawNet:draw?-budget:null};
 }
 function money(value,compact=false,signed=false){
  const n=Math.abs(value),sign=value<0?'−':signed&&value>0?'+':'';
@@ -180,7 +204,15 @@ function money(value,compact=false,signed=false){
  return (Number(valueText)*unit[0]!==n?'≈':'')+sign+'$'+valueText+unit[1];
 }
 function percent(r){return (Math.abs(r)<0.0001&&r!==0?(r>0?'+<0.01':'−<0.01'):(r>0?'+':'')+(r*100).toFixed(2))+'%';}
+function planMethod(p){
+ if(p.mode!=='protect')return p.mode==='balanced'?'Balanced team-win returns.':'Legacy custom split: '+p.share+'% on the odds favorite.';
+ if(p.protection==='target10')return 'Automatic favorite focus: maximize favorite payout while keeping at least 10% net on either team win.';
+ if(p.protection==='breakeven')return '10% on both wins is unavailable. Automatic break-even cover: maximize favorite payout while covering the total stake on an opponent win.';
+ if(p.protection==='equal')return 'Equal odds: no odds favorite. Balanced returns are used.';
+ return 'No protected split at these odds. These stakes are a balanced loss comparison, not a profitable suggestion.';
+}
 function planCondition(p){
+ if(p.mode==='protect'&&p.protection==='unavailable')return 'No protected split: changing the split or lowering filters cannot make both team-win results nonnegative at these prices.';
  if(p.minimumNet>0)return p.drawNet===null?'Positive net if either team wins. A tie/push refunds both stakes (zero net).':'Positive net if either team wins; a draw loses both stakes.';
  if(p.minimumNet===0)return 'At least one team result only breaks even.';
  return p.mode==='balanced'?'These odds cannot produce profit on both team wins.':'This split loses money on at least one team win.';
@@ -189,7 +221,8 @@ function assessment(q,p=getPlan(q)){
  if(!p)return {tier:'unknown',label:'Open to analyze'};
  if(p.drawNet!==null)return {tier:'draw',label:'Draw risk',detail:'Three-way market: a draw loses '+money(p.budget)+'. Not an all-outcome profit.'};
  const roi=p.minimumNet/p.budget,tier=roi>=0.05?'yellow':roi>=0.02?'green':roi>0?'orange':roi===0?'even':'loss';
- return {tier,roi,label:percent(roi),detail:`Lowest team-win net ${money(p.minimumNet,false,true)} (${percent(roi)}) on ${money(p.budget)} total. ${planCondition(p)} Verify both accepted odds.`};
+ if(p.mode==='protect'&&p.protection==='breakeven')return {tier:'cover',roi,label:'Cover · F '+percent(p.favoriteNet/p.budget),detail:`Favorite net ${money(p.favoriteNet,false,true)}; opponent net ${money(p.underdogNet,false,true)}. 10% on both wins is unavailable. Lowest net ${money(p.minimumNet,false,true)}; both stakes refunded gives zero. Verify accepted odds.`};
+ return {tier,roi,label:(p.protection==='unavailable'?'Skip ':'')+percent(roi),detail:`Lowest team-win net ${money(p.minimumNet,false,true)} (${percent(roi)}) on ${money(p.budget)} total. ${planCondition(p)} Verify both accepted odds.`};
 }
 function quoteSignature(e){return JSON.stringify([e.id,e.sport,e.start,e.market,e.participants.map(norm).sort(),e.outcomes.map(o=>[norm(o.name),o.odds,!!o.suspended]).sort((a,b)=>a[0].localeCompare(b[0]))]);}
 function dropInline(view){
@@ -209,21 +242,24 @@ function renderInline(now,ranked){
   if(prior?.signature===sig&&prior.nodes.every(n=>n.isConnected)&&prior.targets.every((n,i)=>n===rows[i].target&&n.classList.contains('twsl-inline-target'))&&prior.nodes[0].parentElement===header&&prior.nodes.slice(1).every((n,i)=>n.parentElement===rows[i].target))continue;
   const open=prior?.nodes[0].open||false;if(prior)dropInline(prior);
   const details=el('details',undefined,'twsl-inline-plan');details.dataset.twslOwned='';details.open=open;
-  const a=assessment(q,plan);const label=el('summary',`${plan.drawNet===null?'Either winner':'Draw not covered'} · ${a.label} · details`);details.append(label);
-  details.append(el('p',`New wagers only. Existing bets are not included. Total: ${money(plan.budget)}.`));
-  details.append(el('p',plan.mode==='balanced'?(plan.drawCovered?'Balanced returns across all three outcomes.':'Balanced team-win returns.'):`Custom split: ${plan.share}% on the odds favorite.${plan.drawCovered?' The rest balances the opponent and draw returns.':''}`));
+  const a=assessment(q,plan);const label=el('summary',`${plan.drawNet===null?(plan.protection==='unavailable'?'No protected split':'Plan'):'Draw not covered'} · ${a.label} · details`);details.append(label);
+  details.addEventListener('click',event=>{event.stopPropagation();if(event.target.closest('summary')){event.preventDefault();details.open=true;openPlanDialog(header);}});
+
+  const content=el('div');
+  content.append(el('p',`New wagers only. Existing bets are not included. Total: ${money(plan.budget)}.`));
+  content.append(el('p',planMethod(plan)));
   const lines=[[q.favorite.name,plan.favoriteStake,plan.favoritePayout,plan.favoriteNet]];
 
   lines.push([q.underdog.name,plan.underdogStake,plan.underdogPayout,plan.underdogNet]);
   for(const [name,stake,payout,net]of lines){
-   const line=el('p');line.append(el('strong',name+': '),el('span',`Bet ${money(stake)}`,'twsl-stake'),document.createTextNode(` · payout ${money(payout)} · `),el('span',`net ${money(net,false,true)}`,net>0?'twsl-profit':net<0?'twsl-loss':'twsl-even'));details.append(line);
+   const line=el('p');line.append(el('strong',name+': '),el('span',`Bet ${money(stake)}`,'twsl-stake'),document.createTextNode(` · payout ${money(payout)} · `),el('span',`net ${money(net,false,true)}`,net>0?'twsl-profit':net<0?'twsl-loss':'twsl-even'));content.append(line);
   }
-  if(plan.drawNet!==null&&!plan.drawCovered)details.append(el('p',`Draw: ${money(plan.drawNet)} net. No draw wager in this plan.`,'twsl-loss'));
-  details.append(el('p',planCondition(plan)),el('p','Net subtracts all wagers in this plan. Inline amounts are rounded for display; exact stakes are above. Estimates use the displayed decimal odds, with payouts rounded down to whole dollars.'));
-  details.append(el('p',`${(q.p*100).toFixed(1)}% Torn implied favorite estimate, not a measured win rate. Observed ${new Date(e.at).toLocaleTimeString()}.`));
-  if(match){for(const row of match.rows)details.append(el('p',`${row.book}: ${row.outcomes.map(o=>o.name+' x'+o.price.toFixed(2)).join(' / ')}`,'twsl-inline-external'));details.append(el('p','External league and settlement equivalence are unverified. These quotes do not change the stake split.'));}
-  else details.append(el('p',unmatchedLabel(),'twsl-inline-external'));
-  const paper=button(journal.some(r=>r.id===journalID(e))?'Paper plan saved':'Save paper plan',async()=>{const message=await recordPaper(q,plan);text(paper,message);});paper.className='twsl-paper-save';details.append(paper);
+  if(plan.drawNet!==null&&!plan.drawCovered)content.append(el('p',`Draw: ${money(plan.drawNet)} net. No draw wager in this plan.`,'twsl-loss'));
+  content.append(el('p',planCondition(plan)),el('p','Net subtracts all wagers in this plan. Inline amounts are rounded for display; exact stakes are above. Estimates use the displayed decimal odds, with payouts rounded down to whole dollars.'));
+  content.append(el('p',`${(q.p*100).toFixed(1)}% Torn implied favorite estimate, not a measured win rate. Observed ${new Date(e.at).toLocaleTimeString()}.`));
+  if(match){for(const row of match.rows)content.append(el('p',`${row.book}: ${row.outcomes.map(o=>o.name+' x'+o.price.toFixed(2)).join(' / ')}`,'twsl-inline-external'));content.append(el('p','External league and settlement equivalence are unverified. These quotes do not change the stake split.'));}
+  else content.append(el('p',unmatchedLabel(),'twsl-inline-external'));
+  const paper=button(journal.some(r=>r.id===journalID(e))?'Paper plan saved':'Save paper plan',async()=>{const message=await recordPaper(q,plan);text(paper,message);});paper.className='twsl-paper-save';content.append(paper);
   header.append(details);
   const nodes=[details],targets=[];
   for(const row of rows){
@@ -233,7 +269,7 @@ function renderInline(now,ranked){
    const profit=el('span',`${net<0?'Loss':'Net'} ${money(net,true,true)}`,net>0?'twsl-profit':net<0?'twsl-loss':'twsl-even');profit.title=`Estimated net ${money(net,false,true)} after all stakes`;profit.setAttribute('aria-label',`${row.name}: estimated net ${money(net,false,true)} after all stakes`);wrap.append(profit);
    row.target.classList.add('twsl-inline-target');ownClassState.set(row.target,row.target.className);row.target.append(wrap);nodes.push(wrap);targets.push(row.target);
   }
-  inlineViews.set(header,{signature:sig,nodes,targets});
+  inlineViews.set(header,{signature:sig,nodes,targets,event:e,plan,content});
  }
  for(const [header,view]of inlineViews)if(!keep.has(header)){dropInline(view);inlineViews.delete(header);}
  let summary=cfg.inline?`${shown} expanded market${shown===1?'':'s'} annotated · ${money(cfg.budget,true)} new total per match`:'Inline plans are off.';
@@ -242,8 +278,44 @@ function renderInline(now,ranked){
   else if(!expandedCards)summary+=' Open a 2-Way Full event or 3-Way Ordinary time market.';
   else summary+=' No fresh expanded markets meet the saved filters.';
  }
- text(inlineStatusBox,summary);
+ text(inlineStatusBox,summary);refreshPlanDialog();
 }
+let planOverlay,planPanel,planContent,planTitle,planClose,planHeader,planFocus,planDialogSignature='';
+function closePlanDialog(){
+ if(!planOverlay)return;planOverlay.hidden=true;
+ const view=inlineViews.get(planHeader);if(view)view.nodes[0].open=false;
+ planHeader=null;planDialogSignature='';if(planFocus?.isConnected)planFocus.focus();
+}
+function ensurePlanDialog(){
+ if(planOverlay){if(!planOverlay.isConnected)document.body.append(planOverlay);return;}
+ planOverlay=el('div');planOverlay.id='twsl-plan-overlay';planOverlay.hidden=true;planOverlay.dataset.twslOwned='';
+ planPanel=el('section');planPanel.id='twsl-plan-dialog';planPanel.setAttribute('role','dialog');planPanel.setAttribute('aria-modal','true');planPanel.setAttribute('aria-labelledby','twsl-plan-title');
+ const head=el('div',undefined,'twsl-dialog-bar');planTitle=el('h2');planTitle.id='twsl-plan-title';planClose=button('Close ×',closePlanDialog);planClose.setAttribute('aria-label','Close calculation details');head.append(planTitle,planClose);
+ planContent=el('div',undefined,'twsl-dialog-content');planPanel.append(head,planContent);planOverlay.append(planPanel);document.body.append(planOverlay);
+ planOverlay.addEventListener('click',event=>{event.stopPropagation();if(event.target===planOverlay)closePlanDialog();});
+ planOverlay.addEventListener('keydown',event=>{
+  if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closePlanDialog();return;}
+  if(event.key!=='Tab')return;const controls=[...planPanel.querySelectorAll('button:not(:disabled),a[href],[tabindex="0"]')].filter(n=>!n.hidden),first=controls[0],last=controls[controls.length-1];
+  if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}
+  else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}
+ });
+}
+function refreshPlanDialog(){
+ if(!planHeader||!planOverlay||planOverlay.hidden)return;
+ const view=inlineViews.get(planHeader);
+ if(!view||!planHeader.isConnected){closePlanDialog();return;}
+ if(view.signature===planDialogSignature&&planOverlay.isConnected)return;
+ ensurePlanDialog();planFocus=view.nodes[0].querySelector('summary');planDialogSignature=view.signature;text(planTitle,view.event.name);const hadContentFocus=planContent.contains(document.activeElement);planContent.replaceChildren();
+ for(const child of view.content.children){const copy=child.cloneNode(true);
+  if(copy.matches('button.twsl-paper-save'))copy.addEventListener('click',async()=>{const current=events.get(journalID(view.event)),q=current&&qualifying(current);text(copy,q?await recordPaper(q,view.plan):'Plan expired; reopen match');});
+  planContent.append(copy);
+ }
+ if(hadContentFocus)planClose.focus();
+}
+function openPlanDialog(header){
+ const view=inlineViews.get(header);if(!view)return;ensurePlanDialog();planFocus=view.nodes[0].querySelector('summary');planHeader=header;planDialogSignature='';planOverlay.hidden=false;refreshPlanDialog();planClose.focus();
+}
+
 const journalID=e=>e.id+'|'+e.market;
 function loadJournal(value){
  if(!Array.isArray(value))return [];
@@ -256,10 +328,10 @@ function loadJournal(value){
   const legs=r.legs.map(l=>{const ratio=decimalRatio(l.odds);return {name:l.name,odds:l.odds,stake:l.stake,payout:Number(BigInt(l.stake)*ratio.n/ratio.d)};});
   const result=['pending','a','b','refund',...(r.id.endsWith('3-Way Ordinary time')?['draw']:[])].includes(r.result)?r.result:'pending';
   const actual=r.actual&&Number.isSafeInteger(r.actual.stake)&&r.actual.stake>0&&r.actual.stake<=1e9&&Number.isSafeInteger(r.actual.payout)&&r.actual.payout>=0&&r.actual.payout<=1e15?{stake:r.actual.stake,payout:r.actual.payout}:null;
-  unique.set(r.id,{id:r.id,name:legs.map(l=>l.name).join(' v '),start:r.start,at:r.at,budget:r.budget,legs,result,actual,version:String(r.version||'unknown').slice(0,20),mode:r.mode==='custom'?'custom':'balanced'});
+  unique.set(r.id,{id:r.id,name:legs.map(l=>l.name).join(' v '),start:r.start,at:r.at,budget:r.budget,legs,result,actual,version:String(r.version||'unknown').slice(0,20),mode:['custom','protect'].includes(r.mode)?r.mode:'balanced'});
  }return [...unique.values()];
 }
-function saveJournal(){const snapshot=JSON.parse(JSON.stringify(journal));journalWrite=journalWrite.then(()=>put('journal',snapshot));return journalWrite;}
+function saveJournal(){if(!ready||readState.get('journal')==='failed')return Promise.resolve(false);const snapshot=JSON.parse(JSON.stringify(journal));journalWrite=journalWrite.then(()=>put('journal',snapshot));return journalWrite;}
 function addPaper(q,p){
  const id=journalID(q.e);if(journal.some(r=>r.id===id))return false;
  if(journal.length>=MAX_RECORDS){const i=journal.findIndex(r=>r.result!=='pending');if(i<0)return false;journal.splice(i,1);}
@@ -441,7 +513,17 @@ function listingAssessment(state,now,index){
  if(records.some(e=>e.start<=now))return {tier:'neutral',label:'Started',detail:'Pre-match analysis has ended.'};
  if(records.length&&records.every(e=>now-e.at>TTL))return {tier:'neutral',label:'Stale',detail:'Prices are over 5 minutes old. Reopen the native market for a new observation.'};
  if(records.some(e=>e.market==='3-Way Ordinary time'))return {tier:'draw',label:'Draw risk',detail:'Three-way market excluded by default. Betting both teams leaves the draw uncovered.'};
- if(records.length)return {tier:'neutral',label:'Filtered',detail:'Outside the saved filters or next-24-hour window.'};
+ if(records.length){
+  const e=records.find(e=>e.market==='2-Way Full event')||records[0];let reason='Outside the saved filters';
+  if(e.start>now+DAY)reason='Starts beyond the next 24 hours';
+  else if(cfg.sports.length&&!cfg.sports.includes(e.sport))reason='Sport excluded by saved selection';
+  else if(cfg.events.length&&!cfg.events.includes(e.id))reason='Match excluded by saved selection';
+  else if(cfg.sex!=='both'&&gender(e)!==cfg.sex)reason='Event category excluded or unknown';
+  else if(cfg.region!=='all')reason='Event country excluded or unknown';
+  else if(cfg.oddsFilters)reason='Favorite or opponent odds outside saved limits';
+  return {tier:'neutral',label:e.start>now+DAY?'Over 24h':'Filtered',detail:reason+'. Reset filters in settings to clear saved selections.'};
+ }
+
  if(state.diagnostic.unsupportedHeaders)return {tier:'neutral',label:'Unsupported',detail:'This is not a supported complete full-match winner market.'};
  return {tier:'unknown',label:'Open to analyze',detail:'No complete winner prices captured. Open this match. No odds have been assumed.'};
 }
@@ -489,7 +571,7 @@ function hook(){
  proto.send=function(...args){if(urls.get(this))this.addEventListener('load',function(){try{if(this.status===200)consume(this.responseType==='json'?this.response:JSON.parse(this.responseText));}catch(_){log('Bookie capture unavailable',{},'DEBUG');}},{once:true});return Reflect.apply(send,this,args);};
  log('Passive Bookie response capture installed');}catch(_){log('Response hook unavailable; DOM capture remains active',{},'WARN');}
 }
-function schedule(discover=false){if(discover===true)discoverCards=true;if(!frame)frame=requestAnimationFrame(()=>{frame=0;if(!document.body)return;mount();scanDOM(false);render();});}
+function schedule(discover=false){if(discover===true)discoverCards=true;if(!ready)return;if(!frame)frame=requestAnimationFrame(()=>{frame=0;if(!document.body)return;try{mount();safeScan(false);render();}catch(error){reportRuntime('page update',error);}});}
 function sportFamily(s){const n=norm(s).replace(/ /g,'');return ({football:'soccer',soccer:'soccer',americanfootball:'americanfootball',basketball:'basketball',baseball:'baseball',icehockey:'icehockey',tennis:'tennis',cricket:'cricket',mma:'mma',mixedmartialarts:'mma',boxing:'boxing',rugbyleague:'rugbyleague',rugbyunion:'rugbyunion',aussierules:'aussierules'})[n]||'';}
 function externalMatch(e){
  const family=sportFamily(e.sport);if(!family)return null;
@@ -620,7 +702,7 @@ function scheduleExpiry(now){
  // A deadline for data expiry only. DOM discovery is observer-driven.
  if(next<Infinity)expiryTimer=setTimeout(()=>render(),Math.max(1,Math.min(2147483647,next-now)));
 }
-function render(){
+function renderContent(){
  if(!root)return;metrics.renders++;const now=Date.now(),ranked=rankings(now),matched=ranked.map(q=>externalMatch(q.e));
  capturePaperPlans(now);renderInline(now,ranked);renderListings(now);renderJournal();
  const seen=new Set([...seenIDs,...metadata.keys()]).size,fresh=[...events.values()].filter(e=>now-e.at<=TTL&&e.start>now).length;
@@ -653,10 +735,14 @@ function render(){
  updateOptions(eventBox,unique.map(e=>[e.id,e.name]),cfg.events);
  root.dataset.twslView=cfg.collapsed?'collapsed':'expanded';clamp();scheduleExpiry(now);
 }
-function clamp(){if(!root)return;const viewport=window.visualViewport,w=viewport?.width||innerWidth,h=viewport?.height||innerHeight;
- cfg.x=Math.max(0,Math.min(Number(cfg.x)||0,w-root.offsetWidth));cfg.y=Math.max(0,Math.min(Number(cfg.y)||0,h-Math.min(root.offsetHeight,h)));root.style.left=cfg.x+'px';root.style.top=cfg.y+'px';}
+function clamp(){
+ if(!root)return;const v=viewportBounds(),width=cfg.collapsed?48:Math.min(380,Math.max(48,v.width-16)),height=cfg.collapsed?48:Math.min(root.offsetHeight||300,v.height-16);
+ const x=Number.isFinite(cfg.x)?cfg.x:v.left+v.width-60,y=Number.isFinite(cfg.y)?cfg.y:v.top+150;
+ cfg.x=Math.max(v.left+4,Math.min(x,v.left+v.width-width-4));cfg.y=Math.max(v.top+4,Math.min(y,v.top+v.height-height-4));
+ root.style.setProperty('left',cfg.x+'px','important');root.style.setProperty('top',cfg.y+'px','important');
+}
 function drag(handle){let d=null,ignore=false;
- handle.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('button')&&e.target!==handle)return;ignore=false;d={id:e.pointerId,x:e.clientX,y:e.clientY,left:cfg.x,top:cfg.y,moved:false};try{handle.setPointerCapture(e.pointerId);}catch(_){} });
+ handle.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('button')&&e.target!==handle)return;ignore=false;uiTouched=true;d={id:e.pointerId,x:e.clientX,y:e.clientY,left:cfg.x,top:cfg.y,moved:false};try{handle.setPointerCapture(e.pointerId);}catch(_){} });
  handle.addEventListener('pointermove',e=>{if(!d||d.id!==e.pointerId)return;const dx=e.clientX-d.x,dy=e.clientY-d.y;if(Math.hypot(dx,dy)>5)d.moved=true;if(d.moved){cfg.x=d.left+dx;cfg.y=d.top+dy;clamp();}});
  const end=e=>{if(!d||d.id!==e.pointerId)return;ignore=d.moved;d=null;void savePrefs();};handle.addEventListener('pointerup',end);handle.addEventListener('pointercancel',end);
  handle.addEventListener('click',e=>{if(ignore){e.preventDefault();e.stopImmediatePropagation();ignore=false;}},true);
@@ -677,19 +763,20 @@ async function saveFilters(){
  cfg={...cfg,min,max,dog,country,oddsFilters:fields.oddsFilters.checked,sex:fields.sex.value,region:fields.region.value,sports:[...sportBox.selectedOptions].map(o=>o.value),events:[...eventBox.selectedOptions].map(o=>o.value)};
  const saved=await savePrefs();text(filterStatusBox,saved?'Filters saved.':'Filters applied for this session; saving failed.');log('Filters applied',{sports:cfg.sports.length,events:cfg.events.length,countryMode:cfg.region});render();
 }
-function syncSplit(){const custom=fields.splitMode.value==='custom';fields.favoriteShare.disabled=!custom;fields.favoriteShare.parentElement.hidden=!custom;}
 async function savePlanSettings(){
- const budget=parseAmount(fields.budget.value),share=Math.round(Number(fields.favoriteShare.value)*100)/100;
+ const budget=parseAmount(fields.budget.value);
  if(!Number.isSafeInteger(budget)||budget<2||budget>1000000000){text(planStatusBox,'Enter a total from $2 to $1b in whole dollars, for example 500m.');fields.budget.focus();return;}
- if(fields.splitMode.value==='custom'&&(!Number.isFinite(share)||share<=50||share>=100)){text(planStatusBox,'Favorite share must be greater than 50% and less than 100%.');fields.favoriteShare.focus();return;}
- if(fields.splitMode.value==='custom'&&BigInt(budget)-(BigInt(budget)*BigInt(Math.round(share*100))+5000n)/10000n<1n){text(planStatusBox,'Leave at least $1 for each side. Increase the total or reduce the favorite share.');return;}
- cfg={...cfg,budget,inline:fields.inline.checked,indicators:fields.indicators.checked,marketScope:fields.marketScope.value,inlineScope:fields.inlineScope.value,splitMode:fields.splitMode.value,favoriteShare:Number.isFinite(share)&&share>50&&share<100?share:cfg.favoriteShare};
+ cfg={...cfg,budget,inline:fields.inline.checked,indicators:fields.indicators.checked,marketScope:fields.marketScope.value,inlineScope:fields.inlineScope.value,splitMode:fields.splitMode.value==='balanced'?'balanced':'protect',planVersion:2};
  render();const saved=await savePrefs();text(planStatusBox,saved?'Inline plan settings saved.':'Plan settings applied for this session; saving failed.');log('Inline plan settings applied',{budget,mode:cfg.splitMode,inline:cfg.inline,marketScope:cfg.marketScope});
+}
+function resetFilters(){
+ Object.assign(cfg,{oddsFilters:false,min:1.3,max:2.5,dog:4,sex:'both',region:'all',country:'',sports:[],events:[],inlineScope:'all'});
+ syncFields();render();void savePrefs().then(ok=>text(filterStatusBox,ok?'Filters reset. Losses and draw risks still reflect the actual market.':'Filters reset for this session.'));
 }
 function mount(){
  if(root){if(!uiStyle.isConnected)document.documentElement.append(uiStyle);if(!root.isConnected)document.body.append(root);return;}
  uiStyle=el('style');uiStyle.id='twsl-ui-css';uiStyle.textContent=`
- #tw-shortlist{position:fixed;width:380px;max-width:calc(100vw - 16px);z-index:2147483638;background:#151c27;color:#e5eaf2;border:1px solid #53647d;border-radius:12px;box-shadow:0 8px 28px #0009;font:13px/1.45 Arial,sans-serif;box-sizing:border-box;overflow:hidden}
+ #tw-shortlist{position:fixed;width:380px;max-width:calc(100vw - 16px);z-index:2147483644!important;background:#151c27;color:#e5eaf2;border:1px solid #53647d;border-radius:12px;box-shadow:0 8px 28px #0009;font:13px/1.45 Arial,sans-serif;box-sizing:border-box;overflow:hidden}
  #tw-shortlist *{box-sizing:border-box}#tw-shortlist .twsl-bar{display:flex;align-items:center;gap:6px;padding:6px 8px;background:#24334b;touch-action:none;cursor:move;user-select:none}
  #tw-shortlist .twsl-bar strong{flex:1}#tw-shortlist button,#tw-shortlist input,#tw-shortlist select{font:inherit;background:#26344a;color:#fff;border:1px solid #718199;border-radius:5px;padding:7px;min-height:40px;max-width:100%}
  #tw-shortlist button{cursor:pointer;touch-action:manipulation}#tw-shortlist button:disabled{opacity:.55;cursor:default}#tw-shortlist .twsl-body{padding:10px;max-height:62vh;max-height:62dvh;overflow:auto;overscroll-behavior:contain}
@@ -700,11 +787,11 @@ function mount(){
  #tw-shortlist .twsl-actions{display:flex;flex-wrap:wrap;gap:6px;margin:5px 0}#tw-shortlist .twsl-numbers{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}#tw-shortlist .twsl-numbers input{min-width:0}
  #tw-shortlist summary{cursor:pointer;min-height:40px;display:list-item;padding:8px 0;color:#c6dbf5}#tw-shortlist details{margin:5px 0}#tw-shortlist details>details{padding-left:8px}#tw-shortlist [role=status]{overflow-wrap:anywhere}#tw-shortlist [hidden]{display:none!important}
  #tw-shortlist[data-twsl-view=collapsed]{width:48px;height:48px;border-radius:50%}#tw-shortlist[data-twsl-view=collapsed]>.twsl-bar,#tw-shortlist[data-twsl-view=collapsed]>.twsl-body{display:none}
- #tw-shortlist-token{display:none;width:48px;height:48px;border:0!important;font-size:25px!important;touch-action:none}#tw-shortlist[data-twsl-view=collapsed]>#tw-shortlist-token{display:block}
+ #tw-shortlist-token{display:none;width:48px;height:48px;border:0!important;font-size:25px!important;touch-action:none}#tw-shortlist[data-twsl-view=collapsed]>#tw-shortlist-token{display:block!important;visibility:visible!important;opacity:1!important}
  #tw-shortlist #tw-shortlist-support{position:static!important;inset:auto!important;width:100%!important;margin-top:12px}#tw-shortlist button:focus-visible,#tw-shortlist summary:focus-visible{outline:2px solid #a4d8f4}
  #tw-shortlist a{color:#91caff;text-decoration:underline}#tw-shortlist .twsl-muted{font-size:12px;color:#b1bdce}
  .twsl-list-signal{display:inline-flex!important;align-items:center;vertical-align:baseline;gap:4px;margin-right:7px;padding:0 4px;border-radius:4px;background:#101923;color:#b7c5d6;font:600 11px/1.6 Arial,sans-serif;white-space:nowrap;float:none!important}
- .twsl-list-signal .twsl-dot{font-size:14px;line-height:1}.twsl-list-signal.twsl-tier-yellow{color:#ffe568;background:#39310d}.twsl-list-signal.twsl-tier-green{color:#9bf0b4;background:#153324}.twsl-list-signal.twsl-tier-orange{color:#ffc17b;background:#432b13}.twsl-list-signal.twsl-tier-loss{color:#ffb3b3;background:#442428}.twsl-list-signal.twsl-tier-draw{color:#dcc3ff;background:#332746}
+ .twsl-list-signal .twsl-dot{font-size:14px;line-height:1}.twsl-list-signal.twsl-tier-yellow{color:#ffe568;background:#39310d}.twsl-list-signal.twsl-tier-green{color:#9bf0b4;background:#153324}.twsl-list-signal.twsl-tier-orange{color:#ffc17b;background:#432b13}.twsl-list-signal.twsl-tier-cover{color:#9de9f6;background:#16333d}.twsl-list-signal.twsl-tier-loss{color:#ffb3b3;background:#442428}.twsl-list-signal.twsl-tier-draw{color:#dcc3ff;background:#332746}
  .twsl-tier-unknown .twsl-signal-label{display:none!important}
  .bets-wrap .twsl-paper-save{font:inherit;background:#26344a;color:#c6d1df;border:1px solid #718199;border-radius:4px;min-height:36px;padding:6px;cursor:pointer}
  .bets-wrap .result.twsl-inline-target{display:flex!important;align-items:center;flex-wrap:wrap;gap:4px 8px;white-space:normal!important;min-width:0;line-height:1.4}
@@ -714,28 +801,38 @@ function mount(){
  [data-twsl-owned] .twsl-profit{color:#93f2b4!important;background:#163d29!important;border:1px solid #438c5c}
  [data-twsl-owned] .twsl-loss,#tw-shortlist .twsl-loss{color:#ffb3b3!important;background:#492225!important;border:1px solid #a95761}
  [data-twsl-owned] .twsl-even{color:#efcf8b!important;background:#3e3521!important;border:1px solid #928053}
- .bets-wrap details.twsl-inline-plan{clear:both;text-align:left;white-space:normal;margin:6px 0 0;font:12px/1.5 Arial,sans-serif;color:#c6d1df}
- .bets-wrap .twsl-inline-plan>summary{display:list-item;list-style:disclosure-closed inside;cursor:pointer;padding:6px 3px;min-height:32px;color:#9dcbf6;touch-action:manipulation}
- .bets-wrap .twsl-inline-plan[open]>summary{list-style-type:disclosure-open}
- .bets-wrap .twsl-inline-plan>p{display:block;float:none;width:auto!important;height:auto!important;margin:6px 0;padding:0 4px;font:inherit;text-align:left;color:inherit}
- .bets-wrap .twsl-inline-plan>p.twsl-loss{padding:3px 6px;white-space:normal}
- .bets-wrap .twsl-inline-plan .twsl-inline-external{color:#a4d8f4}
- .bets-wrap .twsl-inline-plan summary:focus-visible{outline:2px solid #90caff}
+ /* Only the compact launcher lives inside Torn's fixed-height market row. */
+ .bets-wrap details.twsl-inline-plan{display:inline-block!important;position:static!important;float:none!important;clear:none!important;width:auto!important;height:auto!important;max-width:100%;margin:0 0 0 8px!important;padding:0!important;font:12px/1.4 Arial,sans-serif!important;color:#b9dcff;vertical-align:middle;overflow:hidden!important}
+ .bets-wrap details.twsl-inline-plan>summary{display:block!important;position:static!important;float:none!important;width:auto!important;height:auto!important;list-style:none!important;cursor:pointer;padding:4px!important;color:#b9dcff!important;font:12px/1.4 Arial,sans-serif!important;white-space:normal!important}
+ .bets-wrap details.twsl-inline-plan>summary::before{content:'▸ ';}.bets-wrap details.twsl-inline-plan>summary::-webkit-details-marker{display:none}
+ .bets-wrap details.twsl-inline-plan>:not(summary){display:none!important}
+ #twsl-plan-overlay{position:fixed!important;inset:0!important;z-index:2147483645!important;display:flex!important;align-items:center;justify-content:center;padding:12px!important;margin:0!important;background:#000a!important;box-sizing:border-box!important;isolation:isolate}
+ #twsl-plan-overlay[hidden]{display:none!important}
+ #twsl-plan-dialog{display:block!important;position:relative!important;float:none!important;width:600px!important;max-width:100%!important;max-height:calc(100vh - 24px)!important;max-height:calc(100dvh - 24px)!important;height:auto!important;margin:0!important;padding:0!important;overflow:auto!important;overscroll-behavior:contain;background:#151e2b!important;color:#e6edf7!important;border:1px solid #7192b5!important;border-radius:12px!important;box-shadow:0 12px 48px #000b!important;font:14px/1.5 Arial,sans-serif!important;text-align:left!important;white-space:normal!important}
+ #twsl-plan-dialog *{box-sizing:border-box;float:none!important;position:static!important;white-space:normal!important}
+ #twsl-plan-dialog .twsl-dialog-bar{display:flex!important;align-items:center!important;gap:10px;padding:12px!important;background:#233650!important}
+ #twsl-plan-dialog h2{flex:1;font:600 16px/1.4 Arial,sans-serif!important;margin:0!important;padding:0!important;width:auto!important;height:auto!important;color:#ecf4ff!important}
+ #twsl-plan-dialog button{display:inline-block!important;width:auto!important;height:auto!important;min-height:42px;padding:8px 12px!important;margin:0!important;border:1px solid #7192b5!important;border-radius:6px;background:#263b56!important;color:#fff!important;font:14px/1.4 Arial,sans-serif!important;cursor:pointer;touch-action:manipulation}
+ #twsl-plan-dialog .twsl-dialog-content{display:block!important;padding:12px!important;width:100%!important;height:auto!important}
+ #twsl-plan-dialog p{display:block!important;width:auto!important;height:auto!important;margin:0 0 12px!important;padding:0!important;font:14px/1.5 Arial,sans-serif!important;text-align:left!important;color:inherit!important;line-height:1.5!important;overflow-wrap:anywhere}
+ #twsl-plan-dialog strong,#twsl-plan-dialog span{width:auto!important;height:auto!important}
+ #twsl-plan-dialog .twsl-inline-external{color:#a4d8f4!important}
+ #twsl-plan-dialog button:focus-visible,.bets-wrap .twsl-inline-plan summary:focus-visible{outline:2px solid #a4d8f4;outline-offset:2px}
  `;document.documentElement.append(uiStyle);
- root=el('section');root.id='tw-shortlist';root.setAttribute('aria-label','Bookie shortlist');
- const token=button('🎟️',()=>{cfg.collapsed=false;render();void savePrefs();});token.id='tw-shortlist-token';token.title='Open Bookie shortlist; drag to move';token.setAttribute('aria-label','Open Bookie shortlist');drag(token);
+ root=el('section');root.id='tw-shortlist';root.dataset.twslView=cfg.collapsed?'collapsed':'expanded';root.setAttribute('aria-label','Bookie shortlist');
+ const token=button('🎟️',()=>{uiTouched=true;cfg.collapsed=false;render();void savePrefs();});token.id='tw-shortlist-token';token.title='Open Bookie shortlist; drag to move';token.setAttribute('aria-label','Open Bookie shortlist');drag(token);
  const bar=el('div',undefined,'twsl-bar');gearButton=button('⚙️',()=>showSettings(settings.hidden));gearButton.id='twsl-settings-toggle';gearButton.title='Settings';gearButton.setAttribute('aria-label','Settings');gearButton.setAttribute('aria-expanded','false');
- const minimize=button('−',()=>{cfg.collapsed=true;render();void savePrefs();});minimize.setAttribute('aria-label','Minimize shortlist');bar.append(el('strong','🎟️ Bookie shortlist'),gearButton,minimize);drag(bar);
- body=el('div',undefined,'twsl-body');home=el('div');settings=el('section');settings.hidden=true;
+ const minimize=button('−',()=>{uiTouched=true;cfg.collapsed=true;render();placeTicket();void savePrefs();});minimize.setAttribute('aria-label','Minimize shortlist');bar.append(el('strong','🎟️ Bookie shortlist'),gearButton,minimize);drag(bar);
+ body=el('div',undefined,'twsl-body');runtimeStatus=el('p',undefined,'twsl-runtime-status');runtimeStatus.setAttribute('role','status');runtimeStatus.hidden=true;body.append(runtimeStatus);home=el('div');settings=el('section');settings.hidden=true;
  statusBox=el('div');statusBox.setAttribute('role','status');statusBox.hidden=true;
  const actions=el('div',undefined,'twsl-actions');externalButton=button('Check external odds',()=>void refreshExternal());externalButton.id='twsl-check-external';
- const recheck=button('Recheck',()=>{scanDOM();render();note('Captured data rechecked. Open or reopen matches to capture prices.');});recheck.title='Recheck loaded markets; this does not request new prices';
+ const recheck=button('Recheck',()=>{safeScan(true);render();note('Captured data rechecked. Open or reopen matches to capture prices.');});recheck.title='Recheck loaded markets; this does not request new prices';
  stopButton=button('Stop',()=>{stopped=true;stopButton.disabled=true;providerStatus='Stopping after the current request...';render();});stopButton.id='twsl-stop';stopButton.hidden=true;bar.insertBefore(stopButton,gearButton);
  actions.append(externalButton,recheck);coverageBox=el('div',undefined,'twsl-coverage');resultBox=el('div');providerBox=el('p',undefined,'twsl-web');providerBox.setAttribute('role','status');
  inlineStatusBox=el('p');inlineStatusBox.setAttribute('role','status');home.append(statusBox,inlineStatusBox,actions,coverageBox,providerBox);
  const rankedGroup=group(home,'Best captured returns');rankedGroup.id='twsl-ranked-summary';rankedGroup.append(resultBox);
  const about=group(home,'Colors, coverage and method');coverageDetails=el('p');
- about.append(coverageDetails,el('p','Yellow: at least 5% net. Green: 2% to below 5%. Orange: above 0% to below 2%. Percentages use the LOWER team-win net divided by the total stake. These tiers are display thresholds, not win probabilities.'),el('p','Gray: unknown, stale, filtered or break-even. Red: a loss. Purple: uncovered draw risk. Open an unseen match to capture its prices. External quotes cannot fill missing Torn odds.'),el('p','Next 24 hours. Best returns ranks the worst calculated outcome, not the favorite’s win probability. Positive two-way plans can be rare. A tie/push refunds both stakes, giving zero net. Verify accepted odds on both bets; existing wagers are not included.'));
+ about.append(coverageDetails,el('p','Yellow: at least 5% net. Green: 2% to below 5%. Orange: above 0% to below 2%. Percentages use the LOWER team-win net divided by the total stake. These tiers are display thresholds, not win probabilities.'),el('p','Cyan Cover: opponent break-even cover with favorite upside, not profit on every result. Gray: unknown, stale, filtered or break-even. Red: a loss. Purple: uncovered draw risk. Open an unseen match to capture its prices. External quotes cannot fill missing Torn odds.'),el('p','Next 24 hours. Best returns ranks the worst calculated outcome, then favorite upside for ties. It is not a prediction of win probability. Positive two-way plans can be rare. A tie/push refunds both stakes, giving zero net. Verify accepted odds on both bets; existing wagers are not included.'));
 
  settings.append(button('← Back to shortlist',()=>showSettings(false)),el('p','Version '+VERSION));
  const planSettings=group(settings,'Stakes and display',true);
@@ -745,10 +842,9 @@ function mount(){
  planSettings.append(el('p','Blue = stake. Green = net profit. Red = loss. Two-outcome winner markets are the default.'));
  const advanced=group(planSettings,'Advanced plan options');
  select(advanced,'marketScope','Markets',[['twoWay','Two-outcome winners only'],['all','Also compare three-way (draw uncovered)']],cfg.marketScope);
- select(advanced,'splitMode','Stake split',[['balanced','Balance the two winner returns'],['custom','Custom favorite percentage']],cfg.splitMode).addEventListener('change',syncSplit);
- const shareField=field(advanced,'favoriteShare','Favorite share (%)','number',cfg.favoriteShare);shareField.min='50.01';shareField.max='99.99';shareField.step='0.01';syncSplit();
+ select(advanced,'splitMode','Stake split',[['protect','Automatic favorite focus + opponent cover'],['balanced','Balance the two winner returns']],cfg.splitMode);
  select(advanced,'inlineScope','Annotate',[['all','All loaded matches meeting filters'],['top5','Only the top five ranked matches']],cfg.inlineScope);
- advanced.append(el('p','Balanced mode maximizes the smaller team-win return. Custom 80% with 500m total gives $400m / $100m. Draw betting is not offered; three-way comparisons lose the whole plan on a draw.'),el('p','New wagers only. Torn limits combined bets on one event to $1b, including existing bets. Check both accepted prices before committing.'));
+ advanced.append(el('p','Automatic mode seeks at least 10% net on both team wins, then gives all remaining stake to the odds favorite. If that target is impossible, it seeks break-even opponent cover. If neither works, the market is marked No protected split. This uses prices, not a measured win probability. Draws remain uncovered in three-way comparisons.'),el('p','New wagers only. Torn limits combined bets on one event to $1b, including existing bets. Check both accepted prices before committing.'));
  planStatusBox=el('p');planStatusBox.setAttribute('role','status');const savePlanButton=button('Save inline settings',()=>void savePlanSettings());savePlanButton.id='twsl-save-plan';planSettings.append(savePlanButton,planStatusBox);
 
  externalSettings=group(settings,'The Odds API (optional)');
@@ -773,7 +869,7 @@ function mount(){
  const selections=group(filters,'Choose sports or matches');sportBox=select(selections,'sports','Sports: none selected means all',[],null);sportBox.multiple=true;sportBox.size=4;
  eventBox=select(selections,'events','Matches: none selected means all',[],null);eventBox.multiple=true;eventBox.size=4;
  selections.append(button('Use all sports and matches',()=>{for(const box of [sportBox,eventBox])for(const o of box.options)o.selected=false;}));
- filterStatusBox=el('p');filterStatusBox.setAttribute('role','status');const saveButton=button('Save filters',()=>void saveFilters());saveButton.id='twsl-save-filters';filters.append(saveButton,filterStatusBox);
+ filterStatusBox=el('p');filterStatusBox.setAttribute('role','status');const saveButton=button('Save filters',()=>void saveFilters());saveButton.id='twsl-save-filters';filters.append(saveButton,button('Reset filters',resetFilters),filterStatusBox);
  journalGroup=group(settings,'Local performance journal');journalGroup.id='twsl-journal';
  const track=field(journalGroup,'trackPaper','Auto-save positive two-way paper plans','checkbox','');track.checked=cfg.trackPaper;track.parentElement.className='twsl-check';
  track.addEventListener('change',async()=>{cfg.trackPaper=track.checked;await savePrefs();render();});
@@ -781,11 +877,11 @@ function mount(){
  journalStatusBox=el('p');journalStatusBox.setAttribute('role','status');journalBox=el('div');
  journalGroup.append(button('Export journal',exportJournal),button('Clear journal',async()=>{if(!window.confirm('Clear all local paper plans and manually reported totals? Export first to keep them.'))return;journal=[];cfg.trackPaper=false;fields.trackPaper.checked=false;const ok=await saveJournal();await savePrefs();journalSignature='';renderJournal();text(journalStatusBox,ok?'Journal cleared; auto-recording paused.':'Could not clear saved history.');}),journalStatusBox,journalBox);
  journalGroup.addEventListener('toggle',()=>{if(journalGroup.open)renderJournal();});
- const diagnostics=group(settings,'Diagnostics and support'),debugActions=el('div',undefined,'twsl-actions');debugActions.append(button('🪲',()=>MyDebug.toggleView()),button('📋 Copy Logs to Clipboard',function(){void MyDebug.copy(this);}));diagnostics.append(debugActions);
+ const diagnostics=group(settings,'Diagnostics and support'),debugActions=el('div',undefined,'twsl-actions twsl-debug-actions');debugActions.append(button('🪲',()=>MyDebug.toggleView()),button('📋 Copy Logs to Clipboard',function(){void MyDebug.copy(this);}));diagnostics.append(debugActions,button('Reset ticket position',()=>{uiTouched=true;cfg.collapsed=true;syncView();placeTicket(true);void savePrefs();}));
  const host=el('div');host.id='tw-shortlist-support-host';diagnostics.append(host);
- const privacy=group(settings,'Storage and privacy');privacy.append(el('p','No Torn key is needed. The external key goes only to The Odds API. Remember stores it in userscript storage, if available. Preferences and the local performance journal can use localStorage. No bets are placed or betting history sent. Uncheck Remember and Save & test to remove a stored key while using it this session.'));
+ const privacy=group(settings,'Storage and privacy');privacy.append(el('p','No Torn key is needed. The external key goes only to The Odds API. Remember uses manager-provided storage, if available. On TornPDA this may be browser storage, not a secret vault. Preferences and the local performance journal can use localStorage. No bets are placed or betting history sent. Uncheck Remember and Save & test to remove a stored key while using it this session.'));
  body.append(home,settings);root.append(token,bar,body);document.body.append(root);
- support=new SupportModule({containerId:'tw-shortlist-support',styleId:'tw-shortlist-support-css',getParent:()=>host});clamp();
+ try{support=new SupportModule({containerId:'tw-shortlist-support',styleId:'tw-shortlist-support-css',getParent:()=>host});}catch(error){reportRuntime('support module',error);}syncView();
 }
 function relevantMutation(m){
  const n=m.target.nodeType===1?m.target:m.target.parentElement;
@@ -806,28 +902,130 @@ function relevantMutation(m){
  }else discoverCards=true;
  return true;
 }
-hook();
-async function boot(){
- const stored=await get('settings',{});cfg={...defaults};
- if(stored&&typeof stored==='object')for(const k of Object.keys(defaults))if(Object.prototype.hasOwnProperty.call(stored,k))cfg[k]=stored[k];
- if(!Array.isArray(cfg.sports))cfg.sports=[];if(!Array.isArray(cfg.events))cfg.events=[];
- if(![cfg.min,cfg.max,cfg.dog].every(x=>Number.isFinite(x)&&x>1&&x<=1e6)||cfg.min>cfg.max)Object.assign(cfg,{min:1.3,max:2.5,dog:4});
- if(!['both','men','women'].includes(cfg.sex))cfg.sex='both';if(!['all','us','country','international'].includes(cfg.region))cfg.region='all';
- if(!['eu','us','uk','au'].includes(cfg.providerRegion))cfg.providerRegion='eu';cfg.country=String(cfg.country||'').toUpperCase();
- if(!Number.isSafeInteger(cfg.budget)||cfg.budget<2||cfg.budget>1000000000)cfg.budget=defaults.budget;
- if(!['balanced','custom'].includes(cfg.splitMode))cfg.splitMode='balanced';if(!['all','top5'].includes(cfg.inlineScope))cfg.inlineScope='all';
- if(!Number.isFinite(cfg.favoriteShare)||cfg.favoriteShare<=50||cfg.favoriteShare>=100)cfg.favoriteShare=80;cfg.inline=cfg.inline!==false;cfg.indicators=cfg.indicators!==false;cfg.oddsFilters=cfg.oddsFilters===true;
- cfg.marketScope=cfg.marketScope==='all'?'all':'twoWay';cfg.trackPaper=cfg.trackPaper===true;delete cfg.includeDraw;
- if(!Number.isInteger(cfg.externalLimit)||cfg.externalLimit<1||cfg.externalLimit>20)cfg.externalLimit=5;
- journal=loadJournal(await get('journal',[]));
- key=await get('key','',true);if(typeof key!=='string')key='';key=key.trim();keyStatus=key?'Saved key loaded; tap Save & test key to verify it.':'No key saved.';
- mount();scanDOM();render();
- const observer=new MutationObserver(ms=>{let changed=!root.isConnected||!uiStyle.isConnected;for(const m of ms)if(relevantMutation(m))changed=true;if(changed)schedule();});
- observer.observe(document.documentElement,{childList:true,subtree:true,characterData:true,attributes:true,attributeOldValue:true,attributeFilter:['disabled','aria-disabled','class','title','data-start-timestamp','data-start-time','data-start','datetime','href']});
- window.addEventListener('hashchange',()=>{for(const card of cardStates.keys())dirtyCards.add(card);schedule(true);});window.addEventListener('resize',clamp);window.visualViewport?.addEventListener('resize',clamp);document.addEventListener('visibilitychange',()=>{if(!document.hidden)schedule(true);});
- log('Ready',{version:VERSION,mode:'partial-coverage',keyPresent:!!key});
+let ready=false,bootStarted=false,uiTouched=false,runtimeStatus,recoveryUI,bodyObserver,mainObserver;
+const readState=new Map(),runtimeErrors=new Set(),STORAGE_READ_MS=1800;
+function boundedRead(value){
+ if(!value||typeof value.then!=='function')return Promise.resolve(value);
+ // Deadline for an asynchronous STORAGE bridge, never for finding page DOM.
+ return new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('Storage deadline')),STORAGE_READ_MS);
+  Promise.resolve(value).then(v=>{clearTimeout(timer);resolve(v);},e=>{clearTimeout(timer);reject(e);});});
 }
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>void boot(),{once:true});else void boot();
+function syncView(){
+ if(!root)return;root.dataset.twslView=cfg.collapsed?'collapsed':'expanded';
+ root.style.setProperty('display','block','important');root.style.setProperty('visibility','visible','important');
+ clamp();
+}
+function reportRuntime(stage,error){
+ const kind=error&&typeof error.name==='string'?error.name:'Error',id=stage+'|'+kind;
+ if(!runtimeErrors.has(id)){runtimeErrors.add(id);log('Runtime stage failed',{stage,kind,version:VERSION},'ERROR');}
+ if(runtimeStatus){runtimeStatus.hidden=false;text(runtimeStatus,'A '+stage+' error occurred. The ticket and diagnostics remain available. Copy logs in Diagnostics and support.');}
+ if(!root?.isConnected)rescue();
+}
+function rescue(){
+ if(!document.body)return;
+ if(recoveryUI?.isConnected)return;
+ recoveryUI=el('section');recoveryUI.id='twsl-rescue';recoveryUI.style.cssText='position:fixed!important;right:12px!important;top:150px!important;z-index:2147483646!important;max-width:calc(100vw - 24px);background:#152236;color:white;padding:8px;border:2px solid #81cfff;border-radius:12px;font:14px/1.5 Arial';
+ const panel=el('div');panel.hidden=true;
+ panel.append(el('p','Bookie startup needs attention. Copy the logs, then reload.'),button('🪲',()=>MyDebug.toggleView()),button('📋 Copy Logs to Clipboard',function(){void MyDebug.copy(this);}),button('Reload Bookie',()=>location.reload()));
+ recoveryUI.append(button('🎟️ Bookie recovery',()=>{panel.hidden=!panel.hidden;}),panel);document.body.append(recoveryUI);
+}
+function syncFields(){
+ for(const [name,node]of Object.entries(fields)){
+  if(!Object.prototype.hasOwnProperty.call(cfg,name)||name==='sports'||name==='events')continue;
+  if(node.type==='checkbox')node.checked=!!cfg[name];else node.value=String(cfg[name]??'');
+ }
+ fields.key.value=key;rememberBox.checked=!!key;syncCountry();
+}
+function loadingControls(loading){
+ for(const node of root.querySelectorAll('input,select,button')){
+  if(node.id==='tw-shortlist-token'||node.closest('.twsl-bar,.twsl-debug-actions'))continue;
+  if(loading&&!node.disabled){node.dataset.twslLoading='';node.disabled=true;}
+  else if(!loading&&node.hasAttribute('data-twsl-loading')){node.disabled=false;node.removeAttribute('data-twsl-loading');}
+ }
+ if(!loading)syncCountry();
+}
+function safeScan(force=false){try{scanDOM(force);return true;}catch(error){events.clear();domMarkets=[];discoverCards=true;reportRuntime('market capture',error);return false;}}
+function render(){
+ syncView();if(!ready)return;
+ try{renderContent();}catch(error){reportRuntime('calculation display',error);}
+}
+function viewportBounds(){
+ const v=window.visualViewport,w=v?.width||innerWidth||360,h=v?.height||innerHeight||640;
+ return {left:Math.max(0,v?.offsetLeft||0),top:Math.max(0,v?.offsetTop||0),width:w,height:h};
+}
+function ticketObstructed(x,y){
+ if(typeof document.elementsFromPoint!=='function')return false;
+ for(const [dx,dy]of [[8,8],[24,24],[40,40]]){
+  for(const hit of document.elementsFromPoint(x+dx,y+dy).slice(0,12)){
+   if(hit===root||root?.contains(hit)||hit.closest('[id^="twsl-"],[id^="tw-debug-"]'))continue;
+   for(let node=hit;node&&node!==document.body;node=node.parentElement){
+    const position=getComputedStyle(node).position;
+    if(position==='fixed'||position==='sticky')return true;
+   }
+  }
+ }return false;
+}
+function placeTicket(reset=false){
+ if(!root)return;const v=viewportBounds(),maxX=v.left+Math.max(0,v.width-56),maxY=v.top+Math.max(0,v.height-56);
+ if(reset||!Number.isFinite(cfg.x)||!Number.isFinite(cfg.y))Object.assign(cfg,{x:maxX,y:Math.min(maxY,v.top+150)});
+ clamp();if(!cfg.collapsed||!ticketObstructed(cfg.x,cfg.y))return;
+ const candidates=[[maxX,v.top+150],[v.left+8,v.top+150],[maxX,v.top+v.height*.6],[v.left+8,v.top+v.height*.6],[maxX,v.top+v.height-160],[v.left+8,v.top+v.height-160]];
+ for(const [x,y]of candidates){const px=Math.max(v.left+4,Math.min(x,maxX)),py=Math.max(v.top+4,Math.min(y,maxY));if(!ticketObstructed(px,py)){Object.assign(cfg,{x:px,y:py});clamp();log('Ticket repositioned',{reason:'overlapping floating control'});break;}}
+}
+function observePage(){
+ if(mainObserver)return;
+ mainObserver=new MutationObserver(ms=>{
+  let changed=!root?.isConnected||!uiStyle?.isConnected;
+  for(const m of ms){try{if(relevantMutation(m))changed=true;}catch(error){reportRuntime('page observer',error);}}
+  if(changed)schedule();
+ });
+ mainObserver.observe(document.documentElement,{childList:true,subtree:true,characterData:true,attributes:true,attributeOldValue:true,attributeFilter:['disabled','aria-disabled','class','title','data-start-timestamp','data-start-time','data-start','datetime','href']});
+ window.addEventListener('hashchange',()=>{for(const card of cardStates.keys())dirtyCards.add(card);schedule(true);});
+ window.addEventListener('resize',()=>{clamp();placeTicket();});window.visualViewport?.addEventListener('resize',clamp);
+ window.addEventListener('pageshow',()=>{placeTicket();schedule(true);});
+ document.addEventListener('visibilitychange',()=>{if(!document.hidden){placeTicket();schedule(true);}});
+}
+async function boot(){
+ log('Startup begun',{version:VERSION,bodyPresent:!!document.body,readyState:document.readyState});
+ try{
+  mount();syncView();placeTicket();loadingControls(true);text(runtimeStatus,'Loading saved settings...');runtimeStatus.hidden=false;observePage();
+  log('Interface mounted',{version:VERSION});
+  const [raw,history,savedKey]=await Promise.all([get('settings',{}),get('journal',[]),get('key','',true)]);
+  const earlyUI={x:cfg.x,y:cfg.y,collapsed:cfg.collapsed};let stored=raw;
+  if(typeof stored==='string'){try{stored=JSON.parse(stored);}catch(_){stored={};}}
+  cfg={...defaults};
+  if(stored&&typeof stored==='object'&&!Array.isArray(stored))for(const k of Object.keys(defaults))if(Object.prototype.hasOwnProperty.call(stored,k))cfg[k]=stored[k];
+  if(!Array.isArray(cfg.sports))cfg.sports=[];if(!Array.isArray(cfg.events))cfg.events=[];
+  cfg.sports=cfg.sports.filter(x=>typeof x==='string');cfg.events=cfg.events.filter(x=>typeof x==='string');
+  if(![cfg.min,cfg.max,cfg.dog].every(x=>Number.isFinite(x)&&x>1&&x<=1e6)||cfg.min>cfg.max)Object.assign(cfg,{min:1.3,max:2.5,dog:4});
+  if(!['both','men','women'].includes(cfg.sex))cfg.sex='both';if(!['all','us','country','international'].includes(cfg.region))cfg.region='all';
+  if(!['eu','us','uk','au'].includes(cfg.providerRegion))cfg.providerRegion='eu';cfg.country=String(cfg.country||'').toUpperCase();
+  if(!Number.isSafeInteger(cfg.budget)||cfg.budget<2||cfg.budget>1000000000)cfg.budget=defaults.budget;
+  if(stored?.planVersion!==2||!['balanced','protect'].includes(cfg.splitMode))cfg.splitMode='protect';cfg.planVersion=2;
+  if(!['all','top5'].includes(cfg.inlineScope))cfg.inlineScope='all';
+  cfg.inline=cfg.inline!==false;cfg.indicators=cfg.indicators!==false;cfg.oddsFilters=cfg.oddsFilters===true;cfg.collapsed=cfg.collapsed!==false;
+  cfg.marketScope=cfg.marketScope==='all'?'all':'twoWay';cfg.trackPaper=cfg.trackPaper===true;delete cfg.includeDraw;
+  if(!Number.isInteger(cfg.externalLimit)||cfg.externalLimit<1||cfg.externalLimit>20)cfg.externalLimit=5;
+  if(uiTouched)Object.assign(cfg,earlyUI);
+  let loadedHistory=history;if(typeof history==='string'){try{loadedHistory=JSON.parse(history);}catch(_){loadedHistory=[];}}
+  try{journal=loadJournal(loadedHistory);}catch(error){readState.set('journal','failed');cfg.trackPaper=false;reportRuntime('saved journal',error);}
+  if(readState.get('journal')==='failed')cfg.trackPaper=false;
+  key=typeof savedKey==='string'?savedKey.trim():'';keyStatus=key?'Saved key loaded; tap Save & test key to verify it.':'No key saved.';
+  if(readState.get('key')==='failed')keyStatus='Could not read saved key. External odds remain optional; reload to retry.';
+  ready=true;mount();syncFields();loadingControls(false);syncView();placeTicket();
+  const failed=[...readState].filter(([,state])=>state==='failed').map(([name])=>name);
+  runtimeStatus.hidden=!failed.length;text(runtimeStatus,failed.length?'Could not load '+failed.join(', ')+'. Defaults apply for this session. Unread preferences and journal will not be overwritten; reload to retry.':'');
+  safeScan(true);render();log('Ready',{version:VERSION,mode:'partial-coverage',keyPresent:!!key,storageFailures:failed});
+ }catch(error){reportRuntime('startup',error);if(root){syncView();loadingControls(true);}rescue();}
+}
+function startWhenBodyExists(){
+ if(bootStarted||!document.body)return;bootStarted=true;bodyObserver?.disconnect();
+ // Run after the entire IIFE has initialized the embedded SupportModule class.
+ Promise.resolve().then(boot).catch(error=>reportRuntime('startup',error));
+}
+hook();
+if(document.body)startWhenBodyExists();
+else {bodyObserver=new MutationObserver(startWhenBodyExists);bodyObserver.observe(document,{childList:true,subtree:true});startWhenBodyExists();}
 
 /*
  * Donation UI Module
